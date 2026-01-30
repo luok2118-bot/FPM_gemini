@@ -259,10 +259,11 @@
 
                     <el-table-column prop="last_run" label="上次执行" width="180"></el-table-column>
 
-                    <el-table-column label="操作" width="200" align="right">
+                    <el-table-column label="操作" width="260" align="right">
                         <template #default="scope">
-                            <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'"></el-button>
-                            <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)"></el-button>
+                            <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'" title="立即运行"></el-button>
+                            <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)" title="查看日志"></el-button>
+                            <el-button circle type="danger" plain :icon="Delete" @click="deleteTask(scope.row)" title="删除任务"></el-button>
                         </template>
                     </el-table-column>
                 </el-table>
@@ -330,7 +331,7 @@
         const initApp = () => {
             const { createApp, ref, reactive, onMounted } = Vue;
             // 预先解构图标组件
-            const { DataLine, Plus, VideoPlay, Document, UploadFilled, Check, Refresh, Clock, Cpu, Timer } = ElementPlusIconsVue;
+            const { DataLine, Plus, VideoPlay, Document, UploadFilled, Check, Refresh, Clock, Cpu, Timer, Delete } = ElementPlusIconsVue;
 
             const app = createApp({
                 setup() {
@@ -395,6 +396,25 @@
                         fetchTasks();
                     };
 
+                    const deleteTask = async (row) => {
+                        try {
+                            await ElementPlus.ElMessageBox.confirm(
+                                `确定要删除任务「${row.name}」吗？此操作将删除任务数据与日志，不可恢复。`,
+                                '删除确认',
+                                { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+                            );
+                            const res = await axios.delete(`/api/tasks/${row.id}`);
+                            if (res.data.status === 'success') {
+                                ElementPlus.ElMessage.success('已删除');
+                                fetchTasks();
+                            } else {
+                                ElementPlus.ElMessage.error(res.data.message || '删除失败');
+                            }
+                        } catch (e) {
+                            if (e !== 'cancel') ElementPlus.ElMessage.error(e?.response?.data?.message || '删除失败');
+                        }
+                    };
+
                     const viewLogs = async (row) => {
                         currentTaskId.value = row.id;
                         currentTaskName.value = row.name;
@@ -421,7 +441,8 @@
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
                         currentTaskName, currentEnv, logContent, logDate,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
-                        Plus, VideoPlay, Document, Refresh // 暴露图标
+                        Plus, VideoPlay, Document, Refresh, Delete,
+                        deleteTask
                     };
                 }
             });

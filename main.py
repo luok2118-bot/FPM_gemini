@@ -169,6 +169,32 @@ async def create_task(
     db.close()
     return {"id": task_id}
 
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    db = SessionLocal()
+    try:
+        # 1. 从数据库移除
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return {"status": "error", "message": "Task not found"}
+        db.delete(task)
+        db.commit()
+
+        # 2. 移除定时任务
+        if scheduler.get_job(task_id):
+            scheduler.remove_job(task_id)
+
+        # 3. 物理删除文件夹
+        task_dir = DATA_ROOT / task_id
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+            
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
+
 @app.get("/api/logs/{task_id}")
 def get_log(task_id: str, date: str):
     log_file = DATA_ROOT / task_id / "logs" / f"{date}.log"
