@@ -314,7 +314,7 @@
         <el-dialog v-model="logVisible" :title="currentTaskName" width="850px">
             <div class="log-container">
                 <div class="log-header">
-                    <span>Terminal Output</span>
+                    <span>Terminal Output{{ currentLogDate ? ' · ' + currentLogDate : '' }}</span>
                     <span>Env: {{ currentEnv }}</span>
                 </div>
                 <div class="log-content">{{ logContent }}</div>
@@ -346,7 +346,7 @@
                     const currentTaskName = ref("");
                     const currentEnv = ref("");
                     const logContent = ref("");
-                    const logDate = ref(new Date().toISOString().slice(0, 10));
+                    const currentLogDate = ref("");
 
                     const form = reactive({ name: '', env: '', time: '' });
 
@@ -426,9 +426,11 @@
                     const fetchLog = async () => {
                         if(!currentTaskId.value) return;
                         logContent.value = "Loading...";
+                        currentLogDate.value = "";
                         try {
-                            const res = await axios.get(`/api/logs/${currentTaskId.value}?date=${logDate.value}`);
+                            const res = await axios.get(`/api/logs/${currentTaskId.value}`);
                             logContent.value = res.data.content;
+                            currentLogDate.value = res.data.date || "";
                         } catch(e) { logContent.value = "暂无日志数据"; }
                     };
 
@@ -439,7 +441,7 @@
 
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
-                        currentTaskName, currentEnv, logContent, logDate,
+                        currentTaskName, currentEnv, logContent, currentLogDate,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
                         Plus, VideoPlay, Document, Refresh, Delete,
                         deleteTask

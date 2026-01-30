@@ -196,11 +196,22 @@ async def delete_task(task_id: str):
         db.close()
 
 @app.get("/api/logs/{task_id}")
-def get_log(task_id: str, date: str):
-    log_file = DATA_ROOT / task_id / "logs" / f"{date}.log"
-    if log_file.exists():
-        return {"content": log_file.read_text(encoding="utf-8", errors="replace")}
-    return {"content": "No log entry for this date."}
+def get_log(task_id: str, date: Optional[str] = None):
+    log_dir = DATA_ROOT / task_id / "logs"
+    if not log_dir.exists():
+        return {"content": "暂无日志数据。", "date": None}
+    if date:
+        log_file = log_dir / f"{date}.log"
+        if log_file.exists():
+            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "date": date}
+        return {"content": "No log entry for this date.", "date": None}
+    # 未传 date：返回最新一份日志（按文件名 YYYY-MM-DD.log 排序取最大）
+    log_files = sorted([f for f in log_dir.glob("*.log")], reverse=True)
+    if not log_files:
+        return {"content": "暂无日志数据。", "date": None}
+    latest = log_files[0]
+    date_str = latest.stem
+    return {"content": latest.read_text(encoding="utf-8", errors="replace"), "date": date_str}
 
 @app.post("/api/run_now/{task_id}")
 def run_now(task_id: str):
