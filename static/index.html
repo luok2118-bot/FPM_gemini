@@ -10,7 +10,6 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     
     <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
-    <script src="https://unpkg.com/@element-plus/icons-vue"></script>
 
     <style>
         :root {
@@ -32,7 +31,7 @@
             -webkit-font-smoothing: antialiased;
         }
 
-        [v-cloak] { display: none; } /* 防止 Vue 加载前闪烁 */
+        [v-cloak] { display: none; } 
 
         .header-wrapper {
             background: linear-gradient(135deg, #111827 0%, #1f2937 100%);
@@ -96,12 +95,6 @@
             border-radius: 8px;
             overflow: hidden;
         }
-        .el-table th.el-table__cell {
-            font-weight: 600;
-            text-transform: uppercase;
-            font-size: 12px;
-            letter-spacing: 0.5px;
-        }
 
         .status-badge {
             display: inline-flex;
@@ -133,10 +126,8 @@
 
         .state-Success { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
         .state-Success .dot { background: #3b82f6; }
-
         .state-Failed { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
         .state-Failed .dot { background: #ef4444; }
-
         .state-Idle { background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb; }
         .state-Idle .dot { background: #9ca3af; }
 
@@ -146,25 +137,13 @@
             100% { transform: scale(1); opacity: 0; }
         }
 
-        .el-button--primary {
-            background-color: var(--primary-color);
-            border-color: var(--primary-color);
-            box-shadow: 0 4px 14px 0 rgba(37, 99, 235, 0.39);
-        }
-        .el-button {
-            border-radius: 8px;
-            font-weight: 500;
-        }
-
         .log-container {
             background: #0d1117;
             border-radius: 8px;
             border: 1px solid #30363d;
-            padding: 0;
-            overflow: hidden;
+            height: 500px;
             display: flex;
             flex-direction: column;
-            height: 500px;
         }
         .log-header {
             background: #161b22;
@@ -180,25 +159,11 @@
             padding: 15px;
             overflow-y: auto;
             color: #c9d1d9;
-            font-family: 'JetBrains Mono', 'Consolas', monospace;
+            font-family: 'JetBrains Mono', monospace;
             font-size: 13px;
-            line-height: 1.6;
             white-space: pre-wrap;
         }
-        .log-content::-webkit-scrollbar { width: 8px; }
-        .log-content::-webkit-scrollbar-track { background: #0d1117; }
-        .log-content::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
         
-        .el-upload-dragger {
-            border-radius: 12px;
-            border: 2px dashed #e5e7eb;
-            transition: all 0.3s;
-        }
-        .el-upload-dragger:hover {
-            border-color: var(--primary-color);
-            background-color: #f0f7ff;
-        }
-
         .env-tag {
             background: #f3f4f6;
             color: #374151;
@@ -255,7 +220,7 @@
             <div class="modern-card">
                 <div style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
                     <h3 style="margin: 0; font-weight: 600;">任务监控面板</h3>
-                    <el-button circle plain icon="el-icon-refresh" @click="fetchTasks" size="small">
+                    <el-button circle plain @click="fetchTasks" size="small">
                         <el-icon><refresh></refresh></el-icon>
                     </el-button>
                 </div>
@@ -268,13 +233,13 @@
                         </template>
                     </el-table-column>
 
-                    <el-table-column prop="env" label="环境配置" width="140">
+                    <el-table-column label="环境配置" width="140">
                         <template #default="scope">
                             <span class="env-tag">conda: {{ scope.row.env }}</span>
                         </template>
                     </el-table-column>
 
-                    <el-table-column prop="schedule" label="调度策略" width="140">
+                    <el-table-column label="调度策略" width="140">
                          <template #default="scope">
                             <div style="display: flex; align-items: center; color: var(--text-secondary);">
                                 <el-icon style="margin-right: 4px;"><clock></clock></el-icon> 
@@ -292,94 +257,64 @@
                         </template>
                     </el-table-column>
 
-                    <el-table-column prop="last_run" label="上次执行" width="180">
-                        <template #default="scope">
-                            <span style="font-family: 'Inter', sans-serif; font-variant-numeric: tabular-nums;">
-                                {{ scope.row.last_run }}
-                            </span>
-                        </template>
-                    </el-table-column>
+                    <el-table-column prop="last_run" label="上次执行" width="180"></el-table-column>
 
                     <el-table-column label="操作" width="200" align="right">
                         <template #default="scope">
-                            <el-tooltip content="立即触发计算" placement="top">
-                                <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'"></el-button>
-                            </el-tooltip>
-                            <el-tooltip content="查看执行日志" placement="top">
-                                <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)"></el-button>
-                            </el-tooltip>
+                            <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'"></el-button>
+                            <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)"></el-button>
                         </template>
                     </el-table-column>
                 </el-table>
             </div>
         </div>
 
-        <el-dialog v-model="dialogVisible" title="创建新因子" width="500px" destroy-on-close align-center>
+        <el-dialog v-model="dialogVisible" title="创建新因子" width="500px">
             <el-form :model="form" label-position="top">
                 <el-form-item label="任务名称">
-                    <el-input v-model="form.name" placeholder="例如: Momentum_Alpha_01" size="large"></el-input>
+                    <el-input v-model="form.name" placeholder="例如: Momentum_Alpha_01"></el-input>
                 </el-form-item>
-                
                 <el-form-item label="Python 策略代码">
                     <el-upload
                         class="upload-demo"
-                        action="/api/upload"
+                        action="#" 
+                        :auto-upload="false"
+                        :on-change="handleFileChange"
                         :limit="1"
-                        :on-success="handleUploadSuccess"
-                        drag
-                        style="width: 100%">
+                        drag>
                         <el-icon class="el-icon--upload"><upload-filled></upload-filled></el-icon>
                         <div class="el-upload__text">拖拽 .py 文件到此处，或 <em>点击上传</em></div>
                     </el-upload>
-                    <div v-if="form.script" style="margin-top: 8px; color: #059669; font-size: 12px;">
-                        <el-icon><check></check></el-icon> 已就绪: {{ form.script }}
+                    <div v-if="selectedFile" style="margin-top: 8px; color: #059669; font-size: 12px;">
+                        <el-icon><check></check></el-icon> 已选择: {{ selectedFile.name }}
                     </div>
                 </el-form-item>
-
                 <el-row :gutter="20">
                     <el-col :span="12">
                         <el-form-item label="Conda 环境">
-                            <el-select v-model="form.env" placeholder="选择环境" style="width: 100%" size="large">
+                            <el-select v-model="form.env" style="width: 100%">
                                 <el-option v-for="item in envs" :key="item" :label="item" :value="item"></el-option>
                             </el-select>
                         </el-form-item>
                     </el-col>
                     <el-col :span="12">
                         <el-form-item label="触发时间">
-                            <el-time-select
-                                v-model="form.time"
-                                start="00:00"
-                                step="00:15"
-                                end="23:45"
-                                placeholder="选择时间"
-                                style="width: 100%"
-                                size="large">
-                            </el-time-select>
+                            <el-time-select v-model="form.time" start="00:00" step="00:15" end="23:45" style="width: 100%"></el-time-select>
                         </el-form-item>
                     </el-col>
                 </el-row>
             </el-form>
             <template #footer>
-                <span class="dialog-footer">
-                    <el-button @click="dialogVisible = false">取消</el-button>
-                    <el-button type="primary" @click="createTask" size="large" style="width: 120px;">立即创建</el-button>
-                </span>
+                <el-button @click="dialogVisible = false">取消</el-button>
+                <el-button type="primary" @click="createTask">立即创建</el-button>
             </template>
         </el-dialog>
 
-        <el-dialog v-model="logVisible" :title="currentTaskName" width="850px" align-center>
-            <div slot="header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 15px;">
-                <span style="font-weight: 600; font-size: 16px;">执行日志</span>
-                <div>
-                     <el-date-picker v-model="logDate" type="date" placeholder="选择日期" value-format="YYYY-MM-DD" @change="fetchLog" size="small" style="width: 140px;"></el-date-picker>
-                     <el-button size="small" @click="fetchLog" :icon="Refresh">刷新</el-button>
-                </div>
-            </div>
-            
+        <el-dialog v-model="logVisible" :title="currentTaskName" width="850px">
             <div class="log-container">
                 <div class="log-header">
                     <span>Terminal Output</span>
-                    <span>Running on: {{ currentEnv }}</span>
+                    <span>Env: {{ currentEnv }}</span>
                 </div>
                 <div class="log-content">{{ logContent }}</div>
             </div>
@@ -387,23 +322,14 @@
     </div>
 
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    
     <script src="https://unpkg.com/element-plus"></script>
-    
     <script src="https://unpkg.com/@element-plus/icons-vue"></script>
-    
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
 
     <script>
-        // 增加安全检查，确保所有库都已定义
         const initApp = () => {
-            if (typeof Vue === 'undefined' || typeof ElementPlusIconsVue === 'undefined') {
-                console.error("依赖库加载失败，正在尝试重新初始化...");
-                setTimeout(initApp, 500);
-                return;
-            }
-
             const { createApp, ref, reactive, onMounted } = Vue;
+            // 预先解构图标组件
             const { DataLine, Plus, VideoPlay, Document, UploadFilled, Check, Refresh, Clock, Cpu, Timer } = ElementPlusIconsVue;
 
             const app = createApp({
@@ -413,23 +339,23 @@
                     const loading = ref(false);
                     const dialogVisible = ref(false);
                     const logVisible = ref(false);
+                    const selectedFile = ref(null);
                     
                     const currentTaskId = ref(null);
                     const currentTaskName = ref("");
                     const currentEnv = ref("");
-                    
                     const logContent = ref("");
                     const logDate = ref(new Date().toISOString().slice(0, 10));
 
-                    const form = reactive({ name: '', script: '', env: '', time: '' });
+                    const form = reactive({ name: '', env: '', time: '' });
 
                     const fetchTasks = async () => {
                         loading.value = true;
                         try {
                             const res = await axios.get('/api/tasks');
                             tasks.value = res.data;
-                        } catch(e) { console.error("获取任务失败:", e); }
-                        setTimeout(() => loading.value = false, 300);
+                        } catch(e) { console.error(e); }
+                        loading.value = false;
                     };
 
                     const fetchEnvs = async () => {
@@ -439,35 +365,34 @@
                         } catch(e) { envs.value = ['base']; }
                     };
 
-                    const handleUploadSuccess = (res) => {
-                        form.script = res.filename;
-                        ElementPlus.ElMessage.success('脚本上传成功');
+                    const handleFileChange = (file) => {
+                        selectedFile.value = file.raw;
                     };
 
                     const createTask = async () => {
-                        if(!form.name || !form.script || !form.env || !form.time) {
-                            ElementPlus.ElMessage.warning('请填写所有必填项');
+                        if(!form.name || !form.env || !selectedFile.value) {
+                            ElementPlus.ElMessage.warning('请完善任务信息并上传脚本');
                             return;
                         }
-                        const formData = new FormData();
-                        formData.append('name', form.name);
-                        formData.append('script_name', form.script);
-                        formData.append('conda_env', form.env);
-                        formData.append('time', form.time);
+                        const fd = new FormData();
+                        fd.append('name', form.name);
+                        fd.append('conda_env', form.env);
+                        fd.append('time', form.time);
+                        fd.append('file', selectedFile.value);
 
                         try {
-                            await axios.post('/api/tasks', formData);
-                            ElementPlus.ElMessage.success('任务创建成功');
+                            await axios.post('/api/tasks', fd);
+                            ElementPlus.ElMessage.success('创建成功');
                             dialogVisible.value = false;
+                            selectedFile.value = null;
                             fetchTasks();
-                            form.name = ''; form.script = '';
                         } catch(e) { ElementPlus.ElMessage.error('创建失败'); }
                     };
 
                     const runNow = async (id) => {
                         await axios.post(`/api/run_now/${id}`);
-                        fetchTasks();
                         ElementPlus.ElMessage.info('后台计算已触发');
+                        fetchTasks();
                     };
 
                     const viewLogs = async (row) => {
@@ -490,19 +415,18 @@
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
-                        setInterval(fetchTasks, 5000);
                     });
 
                     return {
-                        tasks, envs, loading, dialogVisible, logVisible, form,
+                        tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
                         currentTaskName, currentEnv, logContent, logDate,
-                        handleUploadSuccess, createTask, runNow, viewLogs, fetchLog, fetchTasks,
-                        Plus, VideoPlay, Document, Refresh
+                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
+                        Plus, VideoPlay, Document, Refresh // 暴露图标
                     };
                 }
             });
 
-            // 全局注册所有图标
+            // 注册所有图标
             for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
                 app.component(key, component);
             }
@@ -511,8 +435,7 @@
             app.mount('#app');
         };
 
-        // 启动
-        initApp();
+        window.onload = initApp;
     </script>
 </body>
 </html>
