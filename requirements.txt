@@ -1,0 +1,11 @@
+# FactorPlatform - Python 3.12
+# 安装: pip install -r requirements.txt
+
+fastapi
+uvicorn[standard]
+pydantic
+apscheduler
+sqlalchemy
+loguru
+uvicorn
+python-multipart
