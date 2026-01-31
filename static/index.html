@@ -197,6 +197,8 @@
         .state-Idle .dot { background: #9ca3af; }
         .state-Unknown { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
         .state-Unknown .dot { background: #ea580c; }
+        .state-Stopped { background: #fefce8; color: #ca8a04; border: 1px solid #fde68a; }
+        .state-Stopped .dot { background: #f59e0b; }
 
         @keyframes pulse {
             0% { transform: scale(1); opacity: 0.8; }
@@ -324,11 +326,21 @@
                         </template>
                     </el-table-column>
 
+                    <el-table-column label="执行时长" width="160">
+                        <template #default="scope">
+                            <span v-if="scope.row.status === 'Running'">
+                                {{ formatDuration(getElapsedSeconds(scope.row)) }}
+                            </span>
+                            <span v-else>-</span>
+                        </template>
+                    </el-table-column>
+
                     <el-table-column prop="last_run" label="上次执行" width="180"></el-table-column>
 
-                    <el-table-column label="操作" width="260" align="right">
+                    <el-table-column label="操作" width="300" align="right">
                         <template #default="scope">
                             <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'" title="立即运行"></el-button>
+                            <el-button circle type="warning" plain :icon="CircleClose" @click="stopTask(scope.row)" :disabled="scope.row.status !== 'Running'" title="强制中止"></el-button>
                             <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)" title="查看日志"></el-button>
                             <el-button circle type="danger" plain :icon="Delete" @click="deleteTask(scope.row)" title="删除任务"></el-button>
                         </template>
@@ -440,7 +452,7 @@
     <script>
         const initApp = () => {
             const { createApp, ref, reactive, onMounted, onUnmounted } = Vue;
-            const { Plus, VideoPlay, Document, Refresh, Delete } = ElementPlusIconsVue;
+            const { Plus, VideoPlay, Document, Refresh, Delete, CircleClose } = ElementPlusIconsVue;
 
             const app = createApp({
                 setup() {
@@ -456,6 +468,7 @@
                     const currentEnv = ref("");
                     const logContent = ref("");
                     const currentLogDate = ref("");
+                    const nowTick = ref(Date.now());
 
                     const form = reactive({ name: '', env: '', time: '', upstream_id: '' });
 
@@ -561,6 +574,43 @@
                         } catch(e) { logContent.value = "暂无日志数据"; }
                     };
 
+                    const getElapsedSeconds = (row) => {
+                        if (!row.last_run_ts) return 0;
+                        const start = Date.parse(row.last_run_ts);
+                        if (Number.isNaN(start)) return 0;
+                        return Math.max(0, Math.floor((nowTick.value - start) / 1000));
+                    };
+
+                    const formatDuration = (totalSeconds) => {
+                        const hours = Math.floor(totalSeconds / 3600);
+                        const minutes = Math.floor((totalSeconds % 3600) / 60);
+                        const seconds = totalSeconds % 60;
+                        if (hours > 0) {
+                            return `${hours}h ${minutes}m ${seconds}s`;
+                        }
+                        if (minutes > 0) {
+                            return `${minutes}m ${seconds}s`;
+                        }
+                        return `${seconds}s`;
+                    };
+
+                    const stopTask = async (row) => {
+                        try {
+                            await ElementPlus.ElMessageBox.confirm(
+                                `确认强制中止任务「${row.name}」吗？该操作会直接终止进程。`,
+                                '强制中止确认',
+                                { type: 'warning', confirmButtonText: '中止', cancelButtonText: '取消' }
+                            );
+                            await axios.post(`/api/stop/${row.id}`);
+                            ElementPlus.ElMessage.success('任务已中止');
+                            fetchTasks(false);
+                        } catch (e) {
+                            if (e !== 'cancel') {
+                                ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '中止失败');
+                            }
+                        }
+                    };
+
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
@@ -607,10 +657,14 @@
                                 setTimeout(connectSSE, 1500);
                             }
                         }, 10000);
+                        const timer = setInterval(() => {
+                            nowTick.value = Date.now();
+                        }, 1000);
                         onUnmounted(() => {
                             if (sseIdleCheckTimer) clearInterval(sseIdleCheckTimer);
                             if (sseEv) sseEv.close();
                             if (pendingRefresh) clearTimeout(pendingRefresh);
+                            clearInterval(timer);
                         });
                     });
 
@@ -618,7 +672,8 @@
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
                         currentTaskName, currentEnv, logContent, currentLogDate,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
-                        Plus, VideoPlay, Document, Refresh, Delete,
+                        getElapsedSeconds, formatDuration, stopTask,
+                        Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
                         deleteTask
                     };
                 }
