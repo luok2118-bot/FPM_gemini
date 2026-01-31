@@ -3,6 +3,7 @@ import uuid
 import queue
 import asyncio
 import subprocess
+import threading
 import datetime
 import shutil
 from pathlib import Path
@@ -78,8 +79,22 @@ async def _sse_broadcast_loop():
         except queue.Empty:
             pass
 
-# --- 核心调度逻辑 ---
+# --- 任务并发控制：每个 task_id 只允许一个实例在跑 ---
+_running_tasks: set = set()
+_running_lock = threading.Lock()
+
 def execute_factor_task(task_id: str):
+    with _running_lock:
+        if task_id in _running_tasks:
+            return  # 已有实例在跑，跳过
+        _running_tasks.add(task_id)
+    try:
+        _do_execute_task(task_id)
+    finally:
+        with _running_lock:
+            _running_tasks.discard(task_id)
+
+def _do_execute_task(task_id: str):
     db = SessionLocal()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
