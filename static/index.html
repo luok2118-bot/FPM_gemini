@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QuantAlpha | 因子计算中台</title>
-    
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -12,6 +12,71 @@
     <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
 
     <style>
+        /* 弹窗圆角与阴影 */
+        .custom-dialog {
+            border-radius: 16px !important;
+            overflow: hidden;
+        }
+
+        /* 表单间距优化 */
+        .modern-form .el-form-item {
+            margin-bottom: 22px;
+        }
+
+        .modern-form .el-form-item__label {
+            font-weight: 600;
+            color: #374151;
+            padding-bottom: 8px !important;
+        }
+
+        /* 上传区域美化 */
+        .modern-upload .el-upload-dragger {
+            border: 2px dashed #e5e7eb;
+            background: #f9fafb;
+            padding: 20px !important;
+            transition: all 0.3s ease;
+        }
+
+        .modern-upload .el-upload-dragger:hover {
+            border-color: #2563eb;
+            background: #f0f7ff;
+        }
+
+        /* 已选文件状态条 */
+        .file-status-bar {
+            display: flex;
+            align-items: center;
+            background: #eff6ff;
+            padding: 8px 12px;
+            border-radius: 8px;
+            margin-top: 10px;
+            border: 1px solid #bfdbfe;
+        }
+
+        .file-name {
+            flex: 1;
+            margin: 0 10px;
+            font-size: 13px;
+            color: #1e40af;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* 渐变按钮 */
+        .glow-button {
+            background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+            border: none !important;
+            padding: 0 30px !important;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
+        }
+
+        .glow-button:hover {
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4);
+            transform: translateY(-1px);
+        }
+
         :root {
             --bg-color: #f3f4f6;
             --card-bg: #ffffff;
@@ -130,6 +195,8 @@
         .state-Failed .dot { background: #ef4444; }
         .state-Idle { background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb; }
         .state-Idle .dot { background: #9ca3af; }
+        .state-Unknown { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
+        .state-Unknown .dot { background: #ea580c; }
 
         @keyframes pulse {
             0% { transform: scale(1); opacity: 0.8; }
@@ -270,44 +337,87 @@
             </div>
         </div>
 
-        <el-dialog v-model="dialogVisible" title="创建新因子" width="500px">
-            <el-form :model="form" label-position="top">
-                <el-form-item label="任务名称">
-                    <el-input v-model="form.name" placeholder="例如: Momentum_Alpha_01"></el-input>
+        <el-dialog 
+            v-model="dialogVisible" 
+            title="配置因子计算任务" 
+            width="540px" 
+            append-to-body
+            class="custom-dialog"
+            destroy-on-close>
+            
+            <el-form :model="form" label-position="top" class="modern-form">
+                <el-form-item label="任务识别名称" required>
+                    <el-input v-model="form.name" placeholder="建议格式: 策略名_频率_版本 (e.g., Alpha101_Daily_V1)" size="large">
+                        <template #prefix><el-icon><edit-pen /></el-icon></template>
+                    </el-input>
                 </el-form-item>
-                <el-form-item label="Python 策略代码">
+        
+                <el-form-item label="数据依赖 (Pipeline)">
+                    <el-select v-model="form.upstream_id" placeholder="选择此任务需要读取哪个任务的输出？" style="width: 100%" clearable size="large">
+                        <template #prefix><el-icon><connection /></el-icon></template>
+                        <el-option v-for="t in tasks" :key="t.id" :label="t.name" :value="t.id">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span>{{ t.name }}</span>
+                                <el-tag size="small" type="info" effect="plain">{{ t.env }}</el-tag>
+                            </div>
+                        </el-option>
+                    </el-select>
+                    <div style="font-size: 11px; color: #9ca3af; margin-top: 4px;">
+                        * 选中后，脚本可通过 $UPSTREAM_OUTPUT_PATH 环境变量访问该任务的数据。
+                    </div>
+                </el-form-item>
+        
+                <el-form-item label="Python 算法脚本 (.py)" required>
                     <el-upload
-                        class="upload-demo"
+                        class="modern-upload"
                         action="#" 
                         :auto-upload="false"
                         :on-change="handleFileChange"
                         :limit="1"
                         drag>
-                        <el-icon class="el-icon--upload"><upload-filled></upload-filled></el-icon>
-                        <div class="el-upload__text">拖拽 .py 文件到此处，或 <em>点击上传</em></div>
+                        <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+                        <div class="el-upload__text">将算法文件拖到此处，或 <em>点击上传</em></div>
                     </el-upload>
-                    <div v-if="selectedFile" style="margin-top: 8px; color: #059669; font-size: 12px;">
-                        <el-icon><check></check></el-icon> 已选择: {{ selectedFile.name }}
-                    </div>
+                    <transition name="el-fade-in">
+                        <div v-if="selectedFile" class="file-status-bar">
+                            <el-icon color="#2563eb"><document /></el-icon>
+                            <span class="file-name">{{ selectedFile.name }}</span>
+                            <el-icon color="#059669"><circle-check-filled /></el-icon>
+                        </div>
+                    </transition>
                 </el-form-item>
+        
                 <el-row :gutter="20">
                     <el-col :span="12">
-                        <el-form-item label="Conda 环境">
-                            <el-select v-model="form.env" style="width: 100%">
+                        <el-form-item label="运行环境">
+                            <el-select v-model="form.env" placeholder="选择 Conda 环境" style="width: 100%" size="large">
                                 <el-option v-for="item in envs" :key="item" :label="item" :value="item"></el-option>
                             </el-select>
                         </el-form-item>
                     </el-col>
                     <el-col :span="12">
-                        <el-form-item label="触发时间">
-                            <el-time-select v-model="form.time" start="00:00" step="00:15" end="23:45" style="width: 100%"></el-time-select>
+                        <el-form-item label="每日触发时间">
+                            <el-time-select 
+                                v-model="form.time" 
+                                start="00:00" 
+                                step="00:15" 
+                                end="23:45" 
+                                placeholder="选择时间"
+                                style="width: 100%"
+                                size="large">
+                            </el-time-select>
                         </el-form-item>
                     </el-col>
                 </el-row>
             </el-form>
+        
             <template #footer>
-                <el-button @click="dialogVisible = false">取消</el-button>
-                <el-button type="primary" @click="createTask">立即创建</el-button>
+                <div class="dialog-footer">
+                    <el-button @click="dialogVisible = false" size="large">取消</el-button>
+                    <el-button type="primary" @click="createTask" size="large" class="glow-button">
+                        部署因子任务
+                    </el-button>
+                </div>
             </template>
         </el-dialog>
 
@@ -329,9 +439,8 @@
 
     <script>
         const initApp = () => {
-            const { createApp, ref, reactive, onMounted } = Vue;
-            // 预先解构图标组件
-            const { DataLine, Plus, VideoPlay, Document, UploadFilled, Check, Refresh, Clock, Cpu, Timer, Delete } = ElementPlusIconsVue;
+            const { createApp, ref, reactive, onMounted, onUnmounted } = Vue;
+            const { Plus, VideoPlay, Document, Refresh, Delete } = ElementPlusIconsVue;
 
             const app = createApp({
                 setup() {
@@ -348,14 +457,26 @@
                     const logContent = ref("");
                     const currentLogDate = ref("");
 
-                    const form = reactive({ name: '', env: '', time: '' });
+                    const form = reactive({ name: '', env: '', time: '', upstream_id: '' });
 
-                    const fetchTasks = async () => {
-                        loading.value = true;
-                        try {
-                            const res = await axios.get('/api/tasks');
-                            tasks.value = res.data;
-                        } catch(e) { console.error(e); }
+                    const fetchTasks = async (showLoading = true) => {
+                        if (showLoading) loading.value = true;
+                        const maxRetries = 5;
+                        const baseDelay = 800;
+                        for (let i = 0; i < maxRetries; i++) {
+                            try {
+                                const res = await axios.get('/api/tasks', { timeout: 10000 });
+                                tasks.value = res.data;
+                                break;
+                            } catch (e) {
+                                if (i === maxRetries - 1) {
+                                    console.error(e);
+                                    if (showLoading) ElementPlus.ElMessage.warning('列表加载失败，请稍后刷新');
+                                } else {
+                                    await new Promise(r => setTimeout(r, baseDelay * (i + 1)));
+                                }
+                            }
+                        }
                         loading.value = false;
                     };
 
@@ -371,8 +492,8 @@
                     };
 
                     const createTask = async () => {
-                        if(!form.name || !form.env || !selectedFile.value) {
-                            ElementPlus.ElMessage.warning('请完善任务信息并上传脚本');
+                        if(!form.name || !form.env || !form.time || !selectedFile.value) {
+                            ElementPlus.ElMessage.warning('请完善任务信息、选择触发时间并上传脚本');
                             return;
                         }
                         const fd = new FormData();
@@ -380,6 +501,7 @@
                         fd.append('conda_env', form.env);
                         fd.append('time', form.time);
                         fd.append('file', selectedFile.value);
+                        if (form.upstream_id) fd.append('upstream_id', form.upstream_id);
 
                         try {
                             await axios.post('/api/tasks', fd);
@@ -391,9 +513,14 @@
                     };
 
                     const runNow = async (id) => {
-                        await axios.post(`/api/run_now/${id}`);
-                        ElementPlus.ElMessage.info('后台计算已触发');
-                        fetchTasks();
+                        try {
+                            await axios.post(`/api/run_now/${id}`);
+                            fetchTasks(false);
+                            ElementPlus.ElMessage.info('后台计算已触发');
+                        } catch (e) {
+                            ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '触发失败');
+                            fetchTasks(false);
+                        }
                     };
 
                     const deleteTask = async (row) => {
@@ -411,7 +538,7 @@
                                 ElementPlus.ElMessage.error(res.data.message || '删除失败');
                             }
                         } catch (e) {
-                            if (e !== 'cancel') ElementPlus.ElMessage.error(e?.response?.data?.message || '删除失败');
+                            if (e !== 'cancel') ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '删除失败');
                         }
                     };
 
@@ -437,6 +564,54 @@
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
+                        // SSE 推送：节流刷新（1 秒内最多一次），断线/空闲超时自动重连
+                        let lastRefresh = 0;
+                        let lastSSEMessageAt = Date.now();
+                        const MIN_INTERVAL = 1000;
+                        const SSE_IDLE_RECONNECT_MS = 35000;
+                        let pendingRefresh = null;
+                        let sseEv = null;
+                        let sseIdleCheckTimer = null;
+                        const doRefresh = () => {
+                            if (!loading.value) {
+                                fetchTasks(false);
+                                lastRefresh = Date.now();
+                            }
+                        };
+                        const onSSEMessage = () => {
+                            lastSSEMessageAt = Date.now();
+                            const now = Date.now();
+                            if (now - lastRefresh >= MIN_INTERVAL) {
+                                doRefresh();
+                            } else if (!pendingRefresh) {
+                                pendingRefresh = setTimeout(() => {
+                                    doRefresh();
+                                    pendingRefresh = null;
+                                }, MIN_INTERVAL - (now - lastRefresh));
+                            }
+                        };
+                        const connectSSE = () => {
+                            if (sseEv) sseEv.close();
+                            sseEv = new EventSource('/api/events');
+                            lastSSEMessageAt = Date.now();
+                            sseEv.onmessage = onSSEMessage;
+                            sseEv.onerror = () => {
+                                sseEv.close();
+                                setTimeout(connectSSE, 2000);
+                            };
+                        };
+                        connectSSE();
+                        sseIdleCheckTimer = setInterval(() => {
+                            if (sseEv && Date.now() - lastSSEMessageAt > SSE_IDLE_RECONNECT_MS) {
+                                sseEv.close();
+                                setTimeout(connectSSE, 1500);
+                            }
+                        }, 10000);
+                        onUnmounted(() => {
+                            if (sseIdleCheckTimer) clearInterval(sseIdleCheckTimer);
+                            if (sseEv) sseEv.close();
+                            if (pendingRefresh) clearTimeout(pendingRefresh);
+                        });
                     });
 
                     return {

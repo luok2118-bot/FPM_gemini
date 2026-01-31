@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# SQLite
+*.db-shm
+*.db-wal
+
+# 项目运行时/数据
+tasks_data/
+logs/*.log
+
+# 静态资源备份
+static/favicon.ico1
+static/favicon.ico2
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

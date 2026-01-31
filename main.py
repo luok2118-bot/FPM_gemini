@@ -1,20 +1,20 @@
 import os
 import uuid
-import json
+import queue
+import asyncio
 import subprocess
 import datetime
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, Text
-from sqlalchemy.orm import sessionmaker, declarative_base
-from loguru import logger
+from sqlalchemy import create_engine, Column, String, DateTime, event
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -24,12 +24,29 @@ DB_PATH = f"sqlite:///{BASE_DIR}/database.db"
 
 # --- 数据库定义 ---
 Base = declarative_base()
-engine = create_engine(DB_PATH, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DB_PATH,
+    connect_args={"check_same_thread": False, "timeout": 20},
+)
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL") # 允许并发读写
+    cursor.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class Task(Base):
     __tablename__ = "tasks"
-    id = Column(String, primary_key=True)  # UUID
+    id = Column(String, primary_key=True)
     name = Column(String)
     script_name = Column(String)
     conda_env = Column(String)
@@ -40,78 +57,151 @@ class Task(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# --- 事件推送逻辑 ---
+_event_queue = queue.Queue()
+_sse_queues: set = set()
+_client_sse_queues: dict[str, asyncio.Queue] = {}
+
+async def _sse_broadcast_loop():
+    # 事件内容仅作触发，不区分类型；取到即向所有 SSE 连接广播 refresh
+    while True:
+        await asyncio.sleep(0.2)
+        try:
+            while True:
+                _event_queue.get_nowait()
+                msg = "data: refresh\n\n"
+                for q in list(_sse_queues):
+                    try:
+                        q.put_nowait(msg)
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+
 # --- 核心调度逻辑 ---
 def execute_factor_task(task_id: str):
     db = SessionLocal()
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if not task: return
-
-    # 1. 准备路径
-    task_dir = DATA_ROOT / task_id
-    script_path = task_dir / "script" / task.script_name
-    log_dir = task_dir / "logs"
-    output_dir = task_dir / "output"
-    
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    log_file = log_dir / f"{today}.log"
-    
-    # 2. 更新状态
-    task.status = "Running"
-    task.last_run = datetime.datetime.now()
-    db.commit()
-
-    # 3. 环境变量注入：让脚本知道自己在哪，以及上游在哪
-    env_vars = os.environ.copy()
-    env_vars["TASK_ID"] = task_id
-    env_vars["OUTPUT_PATH"] = str(output_dir)
-    if task.upstream_id:
-        env_vars["UPSTREAM_OUTPUT_PATH"] = str(DATA_ROOT / task.upstream_id / "output")
-    else:
-        env_vars["UPSTREAM_OUTPUT_PATH"] = ""
-
-    # 4. 执行命令
-    cmd = f'conda run -n {task.conda_env} python -u "{script_path}"'
-    
     try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task: return
+
+        task_dir = DATA_ROOT / task_id
+        script_path = task_dir / "script" / task.script_name
+        env_vars = os.environ.copy()
+        env_vars.update({
+            "TASK_ID": task_id,
+            "OUTPUT_PATH": str(task_dir / "output"),
+            "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
+        })
+
+        task.status = "Running"
+        task.last_run = datetime.datetime.now()
+        db.commit()
+
+        log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*20} [{datetime.datetime.now()}] START {'='*20}\n")
+            f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
             process = subprocess.Popen(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', errors='replace', env=env_vars
+                f'conda run -n {task.conda_env} python -u "{script_path}"',
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', env=env_vars
             )
-            for line in process.stdout:
-                f.write(line)
+            for line in process.stdout: f.write(line)
             process.wait()
             task.status = "Success" if process.returncode == 0 else "Failed"
-    except Exception as e:
-        task.status = "Failed"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\nSYSTEM ERROR: {str(e)}\n")
     finally:
         db.commit()
         db.close()
+        _event_queue.put_nowait("update")
 
 # --- 调度器初始化 ---
-scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(url=DB_PATH)})
+scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=engine)})
 scheduler.start()
 
 # --- FastAPI 接口 ---
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/")
-def index(): return FileResponse("static/index.html")
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse(BASE_DIR / "static" / "favicon.ico")
+
+@app.on_event("startup")
+async def startup():
+    # 将上次崩溃时残留的 Running 任务置为 Unknown，由使用者看日志排查
+    db = SessionLocal()
+    try:
+        db.query(Task).filter(Task.status == "Running").update({"status": "Unknown"}, synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+    asyncio.create_task(_sse_broadcast_loop())
+
+@app.on_event("shutdown")
+def on_shutdown():
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        engine.dispose()
+    except Exception:
+        pass
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+@app.get("/api/events")
+async def sse_events(request: Request):
+    client_id = request.client.host if request.client else "unknown"
+    if client_id in _client_sse_queues:
+        old_q = _client_sse_queues[client_id]
+        try:
+            old_q.put_nowait(None)
+        except Exception:
+            pass
+        _sse_queues.discard(old_q)
+        del _client_sse_queues[client_id]
+    q = asyncio.Queue()
+    _sse_queues.add(q)
+    _client_sse_queues[client_id] = q
+
+    async def stream():
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    msg = "data: ping\n\n"
+                if msg is None:
+                    break
+                try:
+                    yield msg
+                except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError, ConnectionError):
+                    break
+        finally:
+            _sse_queues.discard(q)
+            if _client_sse_queues.get(client_id) == q:
+                _client_sse_queues.pop(client_id, None)
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 @app.get("/api/envs")
 def get_envs():
     try:
         output = subprocess.check_output("conda env list", shell=True, text=True)
         return [line.split()[0] for line in output.splitlines() if line and not line.startswith("#")]
-    except: return ["base"]
+    except Exception:
+        return ["base"]
 
 @app.get("/api/tasks")
-def list_tasks():
-    db = SessionLocal()
+def list_tasks(db: Session = Depends(get_db)):
     tasks = db.query(Task).all()
     res = []
     for t in tasks:
@@ -122,78 +212,55 @@ def list_tasks():
             "last_run": t.last_run.strftime("%Y-%m-%d %H:%M:%S") if t.last_run else "-",
             "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
         })
-    db.close()
     return res
 
 @app.post("/api/tasks")
 async def create_task(
-    name: str = Form(...),
-    conda_env: str = Form(...),
-    time: str = Form(...),
-    upstream_id: Optional[str] = Form(None),
-    file: UploadFile = File(...)
+    name: str = Form(...), conda_env: str = Form(...), time: str = Form(...),
+    upstream_id: Optional[str] = Form(None), file: UploadFile = File(...),
+    db: Session = Depends(get_db)
 ):
     task_id = str(uuid.uuid4())
-    
-    # 1. 创建任务文件夹
     task_dir = DATA_ROOT / task_id
-    (task_dir / "script").mkdir(parents=True)
-    (task_dir / "logs").mkdir(parents=True)
-    (task_dir / "output").mkdir(parents=True)
+    for sub in ["script", "logs", "output"]: (task_dir / sub).mkdir(parents=True)
     
-    # 2. 保存脚本文件
-    script_path = task_dir / "script" / file.filename
-    with open(script_path, "wb") as f:
-        f.write(await file.read())
-        
-    # 3. 记录元数据
-    config = {
-        "id": task_id, "name": name, "env": conda_env, 
-        "upstream": upstream_id, "created_at": str(datetime.datetime.now())
-    }
-    with open(task_dir / "config.json", "w") as f:
-        json.dump(config, f)
+    with open(task_dir / "script" / file.filename, "wb") as f: f.write(await file.read())
 
-    # 4. 存入数据库
-    db = SessionLocal()
-    new_task = Task(
-        id=task_id, name=name, script_name=file.filename,
-        conda_env=conda_env, cron_time=time, upstream_id=upstream_id
-    )
-    db.add(new_task)
-    db.commit()
+    new_task = Task(id=task_id, name=name, script_name=file.filename, conda_env=conda_env, cron_time=time, upstream_id=upstream_id)
+    db.add(new_task); db.commit()
     
-    # 5. 添加定时任务
     h, m = time.split(":")
     scheduler.add_job(execute_factor_task, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id])
-    db.close()
+    _event_queue.put_nowait("changed")
     return {"id": task_id}
 
 @app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: str):
-    db = SessionLocal()
-    try:
-        # 1. 从数据库移除
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            return {"status": "error", "message": "Task not found"}
-        db.delete(task)
-        db.commit()
+async def delete_task(task_id: str, bg: BackgroundTasks, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # 1. 立即从数据库和调度器中移除
+    db.delete(task); db.commit()
+    if scheduler.get_job(task_id): scheduler.remove_job(task_id)
+    
+    # 2. 物理删除交给后台，不阻塞 API 响应，防止死锁
+    bg.add_task(shutil.rmtree, DATA_ROOT / task_id, ignore_errors=True)
+    
+    _event_queue.put_nowait("changed")
+    return {"status": "success"}
 
-        # 2. 移除定时任务
-        if scheduler.get_job(task_id):
-            scheduler.remove_job(task_id)
-
-        # 3. 物理删除文件夹
-        task_dir = DATA_ROOT / task_id
-        if task_dir.exists():
-            shutil.rmtree(task_dir)
-            
-        return {"status": "success"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    finally:
-        db.close()
+@app.post("/api/run_now/{task_id}")
+def run_now(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.status = "Running"
+    task.last_run = datetime.datetime.now()
+    db.commit()
+    scheduler.add_job(execute_factor_task, args=[task_id], id=f"{task_id}_manual")
+    _event_queue.put_nowait("changed")
+    return {"status": "triggered"}
 
 @app.get("/api/logs/{task_id}")
 def get_log(task_id: str, date: Optional[str] = None):
@@ -204,16 +271,20 @@ def get_log(task_id: str, date: Optional[str] = None):
         log_file = log_dir / f"{date}.log"
         if log_file.exists():
             return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "date": date}
-        return {"content": "No log entry for this date.", "date": None}
-    # 未传 date：返回最新一份日志（按文件名 YYYY-MM-DD.log 排序取最大）
-    log_files = sorted([f for f in log_dir.glob("*.log")], reverse=True)
+        return {"content": "该日期无日志。", "date": None}
+    # 无 date 时返回修改时间最新的一份日志
+    log_files = list(log_dir.glob("*.log"))
     if not log_files:
         return {"content": "暂无日志数据。", "date": None}
-    latest = log_files[0]
+    latest = max(log_files, key=lambda p: p.stat().st_mtime)
     date_str = latest.stem
     return {"content": latest.read_text(encoding="utf-8", errors="replace"), "date": date_str}
 
-@app.post("/api/run_now/{task_id}")
-def run_now(task_id: str):
-    scheduler.add_job(execute_factor_task, args=[task_id], id=f"{task_id}_manual")
-    return {"status": "triggered"}
+@app.get("/")
+def index(): return FileResponse("static/index.html")
+
+# --- 核心运行建议 ---
+# 启动（删除操作不触发 reload）：
+#   uvicorn main:app --reload --reload-exclude "tasks_data/*" --reload-exclude "database.db*"
+# 若 Ctrl+C 后进程迟迟不退出，可先关闭浏览器中打开的前端页签再试；
+# 或缩短 keep-alive：uvicorn main:app --reload --timeout-keep-alive 5 ...
