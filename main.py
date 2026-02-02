@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, event, func
+from sqlalchemy import create_engine, Column, String, DateTime, Integer, Float, event, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -70,6 +70,17 @@ class Run(Base):
     log_path = Column(String)
     attempt = Column(Integer, default=1)
     duration_ms = Column(Integer, nullable=True)
+
+class TaskRun(Base):
+    __tablename__ = "task_runs"
+    run_id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    status = Column(String)
+    start_time = Column(DateTime)
+    end_time = Column(DateTime, nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    duration = Column(Float, nullable=True)
+    log_path = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
@@ -196,6 +207,12 @@ def _do_execute_task(task_id: str, trigger_type: str):
         if task:
             task.status = "Failed"
     finally:
+        if run and run.end_time is None:
+            end_time = datetime.datetime.now()
+            run.status = "Failed"
+            run.end_time = end_time
+            run.exit_code = -1
+            run.duration_ms = int((end_time - run.start_time).total_seconds() * 1000)
         db.commit()
         db.close()
         with _task_process_lock:
@@ -312,6 +329,58 @@ def list_tasks(db: Session = Depends(get_db)):
             "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
         })
     return res
+
+def _format_run(run: TaskRun):
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "start_time": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else None,
+        "end_time": run.end_time.strftime("%Y-%m-%d %H:%M:%S") if run.end_time else None,
+        "exit_code": run.exit_code,
+        "duration": run.duration,
+        "log_path": run.log_path,
+    }
+
+def _format_run_from_run(run: Run):
+    return {
+        "run_id": run.id,
+        "id": run.id,
+        "status": run.status,
+        "start_time": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else None,
+        "started_at": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else None,
+        "end_time": run.end_time.strftime("%Y-%m-%d %H:%M:%S") if run.end_time else None,
+        "exit_code": run.exit_code,
+        "duration": run.duration_ms / 1000.0 if run.duration_ms is not None else None,
+        "log_path": run.log_path,
+    }
+
+@app.get("/api/tasks/{task_id}/runs")
+def list_task_runs(task_id: str, limit: int = 20, db: Session = Depends(get_db)):
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    runs = (
+        db.query(Run)
+        .filter(Run.task_id == task_id)
+        .order_by(Run.start_time.desc())
+        .limit(min(limit, 200))
+        .all()
+    )
+    return [_format_run_from_run(run) for run in runs]
+
+@app.get("/api/runs")
+def list_runs_global(limit: int = 50, db: Session = Depends(get_db)):
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    runs = (
+        db.query(Run)
+        .order_by(Run.start_time.desc())
+        .limit(min(limit, 500))
+        .all()
+    )
+    return [_format_run_from_run(run) for run in runs]
 
 @app.post("/api/tasks")
 async def create_task(
