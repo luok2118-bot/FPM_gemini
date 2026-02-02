@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, event
+from sqlalchemy import create_engine, Column, String, DateTime, Integer, event, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -54,7 +54,20 @@ class Task(Base):
     cron_time = Column(String)
     upstream_id = Column(String, nullable=True)
     status = Column(String, default="Idle")
-    last_run = Column(DateTime, nullable=True)
+    last_run = Column(String, nullable=True)
+
+class Run(Base):
+    __tablename__ = "runs"
+    id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    trigger_type = Column(String)
+    status = Column(String, default="Running")
+    start_time = Column(DateTime)
+    end_time = Column(DateTime, nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    log_path = Column(String)
+    attempt = Column(Integer, default=1)
+    duration_ms = Column(Integer, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -83,22 +96,26 @@ async def _sse_broadcast_loop():
 _running_tasks: set = set()
 _running_lock = threading.Lock()
 
-def execute_factor_task(task_id: str):
+def execute_factor_task(task_id: str, trigger_type: str = "cron"):
     with _running_lock:
         if task_id in _running_tasks:
             return  # 已有实例在跑，跳过
         _running_tasks.add(task_id)
     try:
-        _do_execute_task(task_id)
+        _do_execute_task(task_id, trigger_type)
     finally:
         with _running_lock:
             _running_tasks.discard(task_id)
 
-def _do_execute_task(task_id: str):
+def _do_execute_task(task_id: str, trigger_type: str):
     db = SessionLocal()
+    run = None
+    task = None
+    start_time = datetime.datetime.now()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
-        if not task: return
+        if not task:
+            return
 
         task_dir = DATA_ROOT / task_id
         script_path = task_dir / "script" / task.script_name
@@ -109,11 +126,26 @@ def _do_execute_task(task_id: str):
             "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
         })
 
+        last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
+        run_id = str(uuid.uuid4())
+        log_file = task_dir / "logs" / f"{run_id}.log"
+        run = Run(
+            id=run_id,
+            task_id=task_id,
+            trigger_type=trigger_type,
+            status="Running",
+            start_time=start_time,
+            log_path=str(log_file),
+            attempt=last_attempt + 1,
+        )
+        db.add(run)
+
         task.status = "Running"
-        task.last_run = datetime.datetime.now()
+        task.last_run = run_id
         db.commit()
 
-        log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
+        exit_code = None
+        status = "Failed"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
             process = subprocess.Popen(
@@ -123,7 +155,24 @@ def _do_execute_task(task_id: str):
             )
             for line in process.stdout: f.write(line)
             process.wait()
-            task.status = "Success" if process.returncode == 0 else "Failed"
+            exit_code = process.returncode
+            status = "Success" if process.returncode == 0 else "Failed"
+        end_time = datetime.datetime.now()
+        duration_ms = int((end_time - start_time).total_seconds() * 1000)
+        run.end_time = end_time
+        run.exit_code = exit_code
+        run.status = status
+        run.duration_ms = duration_ms
+        task.status = status
+    except Exception:
+        end_time = datetime.datetime.now()
+        duration_ms = int((end_time - start_time).total_seconds() * 1000)
+        if run:
+            run.end_time = end_time
+            run.status = "Failed"
+            run.duration_ms = duration_ms
+        if task:
+            task.status = "Failed"
     finally:
         db.commit()
         db.close()
@@ -147,6 +196,7 @@ async def startup():
     db = SessionLocal()
     try:
         db.query(Task).filter(Task.status == "Running").update({"status": "Unknown"}, synchronize_session=False)
+        db.query(Run).filter(Run.status == "Running").update({"status": "Unknown"}, synchronize_session=False)
         db.commit()
     finally:
         db.close()
@@ -221,10 +271,18 @@ def list_tasks(db: Session = Depends(get_db)):
     res = []
     for t in tasks:
         job = scheduler.get_job(t.id)
+        latest_run = (
+            db.query(Run)
+            .filter(Run.task_id == t.id)
+            .order_by(Run.start_time.desc())
+            .first()
+        )
+        last_run_time = latest_run.start_time.strftime("%Y-%m-%d %H:%M:%S") if latest_run and latest_run.start_time else "-"
+        last_status = latest_run.status if latest_run else "Idle"
         res.append({
             "id": t.id, "name": t.name, "script": t.script_name,
-            "env": t.conda_env, "schedule": t.cron_time, "status": t.status,
-            "last_run": t.last_run.strftime("%Y-%m-%d %H:%M:%S") if t.last_run else "-",
+            "env": t.conda_env, "schedule": t.cron_time, "status": last_status,
+            "last_run": last_run_time,
             "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
         })
     return res
@@ -245,7 +303,7 @@ async def create_task(
     db.add(new_task); db.commit()
     
     h, m = time.split(":")
-    scheduler.add_job(execute_factor_task, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id])
+    scheduler.add_job(execute_factor_task, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
     _event_queue.put_nowait("changed")
     return {"id": task_id}
 
@@ -270,10 +328,7 @@ def run_now(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    task.status = "Running"
-    task.last_run = datetime.datetime.now()
-    db.commit()
-    scheduler.add_job(execute_factor_task, args=[task_id], id=f"{task_id}_manual")
+    scheduler.add_job(execute_factor_task, args=[task_id, "manual"], id=f"{task_id}_manual")
     _event_queue.put_nowait("changed")
     return {"status": "triggered"}
 
