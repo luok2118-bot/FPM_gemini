@@ -138,14 +138,17 @@ def _do_execute_task(task_id: str, trigger_type: str):
 
         last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
         run_id = str(uuid.uuid4())
-        log_file = task_dir / "logs" / f"{run_id}.log"
+        log_dir = task_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_filename = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
+        log_file = task_dir / "logs" / log_filename
         run = Run(
             id=run_id,
             task_id=task_id,
             trigger_type=trigger_type,
             status="Running",
             start_time=start_time,
-            log_path=str(log_file),
+            log_path=str(Path("logs") / log_filename),
             attempt=last_attempt + 1,
         )
         db.add(run)
@@ -382,22 +385,53 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
     return {"status": "stopped"}
 
 @app.get("/api/logs/{task_id}")
-def get_log(task_id: str, date: Optional[str] = None):
+def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(get_db)):
     log_dir = DATA_ROOT / task_id / "logs"
     if not log_dir.exists():
-        return {"content": "暂无日志数据。", "date": None}
-    if date:
-        log_file = log_dir / f"{date}.log"
+        return {"content": "暂无日志数据。", "run_id": None}
+    if run_id:
+        run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+        if not run:
+            return {"content": "未找到对应运行记录。", "run_id": None}
+        log_file = Path(run.log_path or "")
+        if not log_file.is_absolute():
+            log_file = DATA_ROOT / task_id / log_file
         if log_file.exists():
-            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "date": date}
-        return {"content": "该日期无日志。", "date": None}
-    # 无 date 时返回修改时间最新的一份日志
+            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
+        return {"content": "日志文件不存在。", "run_id": run.id}
+
+    run = db.query(Run).filter(Run.task_id == task_id).order_by(Run.start_time.desc()).first()
+    if run:
+        log_file = Path(run.log_path or "")
+        if not log_file.is_absolute():
+            log_file = DATA_ROOT / task_id / log_file
+        if log_file.exists():
+            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
+        return {"content": "日志文件不存在。", "run_id": run.id}
+
     log_files = list(log_dir.glob("*.log"))
     if not log_files:
-        return {"content": "暂无日志数据。", "date": None}
+        return {"content": "暂无日志数据。", "run_id": None}
     latest = max(log_files, key=lambda p: p.stat().st_mtime)
-    date_str = latest.stem
-    return {"content": latest.read_text(encoding="utf-8", errors="replace"), "date": date_str}
+    return {"content": latest.read_text(encoding="utf-8", errors="replace"), "run_id": None}
+
+@app.get("/api/runs/{task_id}")
+def list_runs(task_id: str, db: Session = Depends(get_db)):
+    runs = (
+        db.query(Run)
+        .filter(Run.task_id == task_id)
+        .order_by(Run.start_time.desc())
+        .all()
+    )
+    return [
+        {
+            "id": run.id,
+            "status": run.status,
+            "started_at": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else None,
+            "log_path": run.log_path,
+        }
+        for run in runs
+    ]
 
 @app.get("/")
 def index(): return FileResponse("static/index.html")
