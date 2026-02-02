@@ -12,10 +12,17 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from config import QUEUE_WORKER_CONCURRENCY, QUEUE_EVAL_INTERVAL_SEC
+    from config import (
+        QUEUE_WORKER_CONCURRENCY,
+        QUEUE_EVAL_INTERVAL_SEC,
+        LOG_RETENTION_DAYS,
+        OUTPUT_RETENTION_DAYS,
+    )
 except ImportError:
     QUEUE_WORKER_CONCURRENCY = 1
     QUEUE_EVAL_INTERVAL_SEC = 3
+    LOG_RETENTION_DAYS = 7
+    OUTPUT_RETENTION_DAYS = 30
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -63,6 +70,8 @@ class Task(Base):
     conda_env = Column(String)
     cron_time = Column(String)
     upstream_id = Column(String, nullable=True)
+    task_type = Column(String, default="factor")
+    run_on_non_trading = Column(Integer, default=0)
     status = Column(String, default="Idle")
     last_run = Column(String, nullable=True)
 
@@ -111,7 +120,7 @@ Base.metadata.create_all(bind=engine)
 
 
 def _ensure_tasks_columns():
-    """为已有数据库补充 tasks 表新增列（folder_name），避免 no such column 错误。"""
+    """为已有数据库补充 tasks 表新增列（folder_name 等），避免 no such column 错误。"""
     from sqlalchemy import text
 
     with engine.connect() as conn:
@@ -119,6 +128,10 @@ def _ensure_tasks_columns():
         cols = {row[1] for row in r}
         if "folder_name" not in cols:
             conn.execute(text("ALTER TABLE tasks ADD COLUMN folder_name VARCHAR"))
+        if "task_type" not in cols:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN task_type VARCHAR"))
+        if "run_on_non_trading" not in cols:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN run_on_non_trading INTEGER"))
         conn.commit()
 
 
@@ -181,6 +194,72 @@ def _get_task_dir(task: Task) -> Path:
     return DATA_ROOT / task.id
 
 
+def _is_trading_day(day: datetime.date) -> bool:
+    """简易交易日判断：周一至周五为交易日。"""
+    return day.weekday() < 5
+
+
+def _parse_bool(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _make_output_dir(task_dir: Path, start_time: datetime.datetime) -> Path:
+    """基于时间戳生成输出目录，避免重名。"""
+    base_name = start_time.strftime("%Y%m%d_%H%M%S")
+    output_root = task_dir / "output"
+    candidate = output_root / base_name
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = output_root / f"{base_name}_{suffix}"
+    return candidate
+
+
+def _cleanup_task_logs(task_dir: Path):
+    """清理超过保留天数的日志文件。"""
+    retention_days = max(int(LOG_RETENTION_DAYS or 0), 0)
+    if retention_days <= 0:
+        return
+    log_dir = task_dir / "logs"
+    if not log_dir.exists():
+        return
+    cutoff = time.time() - retention_days * 86400
+    for log_file in log_dir.glob("*.log"):
+        try:
+            if log_file.stat().st_mtime < cutoff:
+                log_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[Path]):
+    """清理输出文件夹：行情更新只保留最新；因子任务按保留天数清理。"""
+    output_root = task_dir / "output"
+    if not output_root.exists():
+        return
+    if (task.task_type or "factor") == "market":
+        if current_output is None:
+            return
+        for path in output_root.iterdir():
+            if current_output and path.resolve() == current_output.resolve():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        return
+    retention_days = max(int(OUTPUT_RETENTION_DAYS or 0), 0)
+    if retention_days <= 0:
+        return
+    cutoff = time.time() - retention_days * 86400
+    for path in output_root.iterdir():
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def enqueue_job(task_id: str, trigger_type: str = "cron"):
     """将任务入队：插入 job_queue 一条 status=Pending、run_date=today 的记录。"""
     db = SessionLocal()
@@ -190,6 +269,8 @@ def enqueue_job(task_id: str, trigger_type: str = "cron"):
             return
         now = datetime.datetime.now()
         run_date = datetime.date.today()
+        if trigger_type == "cron" and not _is_trading_day(run_date) and not bool(task.run_on_non_trading or 0):
+            return
         job_id = str(uuid.uuid4())
         job = JobQueue(
             id=job_id,
@@ -301,8 +382,10 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
         return "Failed"
     task_dir = _get_task_dir(task)
     script_path = task_dir / "script" / task.script_name
-    run_output_dir = Path(run.output_path) if run.output_path else task_dir / "output" / run_id
-    run_output_dir = run_output_dir if run_output_dir.is_absolute() else task_dir / "output" / run_id
+    run_output_dir = Path(run.output_path) if run.output_path else _make_output_dir(task_dir, run.start_time)
+    run_output_dir = run_output_dir if run_output_dir.is_absolute() else task_dir / run_output_dir
+    if not run.output_path:
+        run.output_path = str(run_output_dir)
     run_output_dir.mkdir(parents=True, exist_ok=True)
     log_path = run.log_path
     log_file = task_dir / log_path if not Path(log_path or "").is_absolute() else Path(log_path)
@@ -369,6 +452,8 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     task.status = status
     task.last_run = run_id
     db.commit()
+    _cleanup_task_logs(task_dir)
+    _cleanup_task_outputs(task, task_dir, run_output_dir if status == "Success" else None)
     _event_queue.put_nowait("update")
     return status
 
@@ -435,7 +520,7 @@ def _consumer_worker():
             start_time = datetime.datetime.now()
             run_id = str(uuid.uuid4())
             task_dir = _get_task_dir(task)
-            run_output_dir = task_dir / "output" / run_id
+            run_output_dir = _make_output_dir(task_dir, start_time)
             run_output_dir.mkdir(parents=True, exist_ok=True)
             log_dir = task_dir / "logs"
             log_dir.mkdir(exist_ok=True)
@@ -617,7 +702,9 @@ def list_tasks(db: Session = Depends(get_db)):
             "env": t.conda_env, "schedule": t.cron_time, "status": last_status,
             "last_run": last_run_time,
             "last_run_ts": last_run_ts,
-            "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
+            "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused",
+            "task_type": t.task_type or "factor",
+            "run_on_non_trading": bool(t.run_on_non_trading or 0),
         })
     return res
 
@@ -676,7 +763,10 @@ def list_runs_global(limit: int = 50, db: Session = Depends(get_db)):
 @app.post("/api/tasks")
 async def create_task(
     name: str = Form(...), conda_env: str = Form(...), time: str = Form(...),
-    upstream_id: Optional[str] = Form(None), file: UploadFile = File(...),
+    upstream_id: Optional[str] = Form(None),
+    task_type: str = Form("factor"),
+    run_on_non_trading: Optional[str] = Form(None),
+    file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     task_id = str(uuid.uuid4())
@@ -692,6 +782,8 @@ async def create_task(
     new_task = Task(
         id=task_id, name=name, folder_name=folder_name,
         script_name=file.filename, conda_env=conda_env, cron_time=time, upstream_id=upstream_id,
+        task_type=task_type or "factor",
+        run_on_non_trading=1 if _parse_bool(run_on_non_trading) else 0,
     )
     db.add(new_task); db.commit()
     
