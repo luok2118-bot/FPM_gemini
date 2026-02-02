@@ -7,9 +7,15 @@ import threading
 import datetime
 import shutil
 import signal
-import threading
+import time
 from pathlib import Path
 from typing import Optional
+
+try:
+    from config import QUEUE_WORKER_CONCURRENCY, QUEUE_EVAL_INTERVAL_SEC
+except ImportError:
+    QUEUE_WORKER_CONCURRENCY = 1
+    QUEUE_EVAL_INTERVAL_SEC = 3
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -51,6 +57,8 @@ class Task(Base):
     __tablename__ = "tasks"
     id = Column(String, primary_key=True)
     name = Column(String)
+    # 使用任务目录名，优先由任务名称派生，避免直接使用随机 id 作为文件夹名
+    folder_name = Column(String, nullable=True)
     script_name = Column(String)
     conda_env = Column(String)
     cron_time = Column(String)
@@ -85,7 +93,177 @@ class TaskRun(Base):
     duration = Column(Float, nullable=True)
     log_path = Column(String)
 
+
+class JobQueue(Base):
+    __tablename__ = "job_queue"
+    id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    trigger_type = Column(String)
+    run_date = Column(Date)
+    status = Column(String)  # Pending / Wait / Runnable / Running / Success / Failed / Skipped / Stopped
+    run_id = Column(String, nullable=True)
+    message = Column(String, nullable=True)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_tasks_columns():
+    """为已有数据库补充 tasks 表新增列（folder_name），避免 no such column 错误。"""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        r = conn.execute(text("PRAGMA table_info(tasks)"))
+        cols = {row[1] for row in r}
+        if "folder_name" not in cols:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN folder_name VARCHAR"))
+        conn.commit()
+
+
+def _ensure_runs_columns():
+    """为已有数据库补充 runs 表新增列（run_date、output_path、message 等），避免 no such column 错误。"""
+    from sqlalchemy import text
+    # 模型里可能后加的、可空列：(列名, SQL 类型)
+    optional_columns = [
+        ("run_date", "DATE"),
+        ("output_path", "VARCHAR"),
+        ("message", "VARCHAR"),
+    ]
+    with engine.connect() as conn:
+        r = conn.execute(text("PRAGMA table_info(runs)"))
+        cols = {row[1] for row in r}
+        for name, sql_type in optional_columns:
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}"))
+        conn.commit()
+
+
+_ensure_tasks_columns()
+_ensure_runs_columns()
+
+
+def _sanitize_task_folder_name(name: str) -> str:
+    """根据任务名称生成安全的文件夹名。"""
+    name = (name or "").strip()
+    if not name:
+        return "task"
+    safe_chars = []
+    for ch in name:
+        if ch.isalnum() or ch in "-_ ":
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    safe = "".join(safe_chars)
+    # 把连续空格压缩成单个下划线
+    safe = "_".join(filter(None, safe.split()))
+    return safe or "task"
+
+
+def _ensure_unique_task_folder_name(base_name: str) -> str:
+    """确保在 tasks_data 下文件夹名唯一，如已存在则追加序号。"""
+    existing = {p.name for p in DATA_ROOT.iterdir() if p.is_dir()}
+    candidate = base_name
+    suffix = 1
+    while candidate in existing:
+        suffix += 1
+        candidate = f"{base_name}_{suffix}"
+    return candidate
+
+
+def _get_task_dir(task: Task) -> Path:
+    """根据 Task 记录获取对应的任务目录，优先使用 folder_name。"""
+    folder_name = getattr(task, "folder_name", None)
+    if folder_name:
+        return DATA_ROOT / folder_name
+    # 兼容老数据：老任务仍然使用 id 作为文件夹名
+    return DATA_ROOT / task.id
+
+
+def enqueue_job(task_id: str, trigger_type: str = "cron"):
+    """将任务入队：插入 job_queue 一条 status=Pending、run_date=today 的记录。"""
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return
+        now = datetime.datetime.now()
+        run_date = datetime.date.today()
+        job_id = str(uuid.uuid4())
+        job = JobQueue(
+            id=job_id,
+            task_id=task_id,
+            trigger_type=trigger_type,
+            run_date=run_date,
+            status="Pending",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(job)
+        db.commit()
+        _event_queue.put_nowait("update")
+    finally:
+        db.close()
+
+
+def _upstream_success_for_date(db: Session, upstream_id: str, run_date: datetime.date) -> bool:
+    """是否存在 task_id=upstream_id、run_date、status=Success 的 Run。"""
+    r = (
+        db.query(Run)
+        .filter(
+            Run.task_id == upstream_id,
+            Run.run_date == run_date,
+            Run.status == "Success",
+        )
+        .first()
+    )
+    return r is not None
+
+
+def evaluate_queue_item(db: Session, job: JobQueue) -> str:
+    """
+    评估单条队列表项：若依赖满足则返回 'Runnable'，否则返回 'Wait'。
+    不写库，仅返回目标状态。
+    """
+    task = db.query(Task).filter(Task.id == job.task_id).first()
+    if not task:
+        return "Wait"
+    if not task.upstream_id:
+        return "Runnable"
+    if _upstream_success_for_date(db, task.upstream_id, job.run_date):
+        return "Runnable"
+    return "Wait"
+
+
+def evaluate_pending_and_wait(db: Session):
+    """扫描 status in (Pending, Wait) 的队列表项，按依赖更新为 Runnable 或 Wait。"""
+    now = datetime.datetime.now()
+    for job in db.query(JobQueue).filter(JobQueue.status.in_(["Pending", "Wait"])).all():
+        new_status = evaluate_queue_item(db, job)
+        if job.status != new_status:
+            job.status = new_status
+            job.updated_at = now
+    db.commit()
+
+
+_consumer_stop = threading.Event()
+
+
+def _eval_loop():
+    """后台线程：每 QUEUE_EVAL_INTERVAL_SEC 秒执行一次依赖评估。"""
+    while not _consumer_stop.is_set():
+        _consumer_stop.wait(timeout=QUEUE_EVAL_INTERVAL_SEC)
+        if _consumer_stop.is_set():
+            break
+        db = SessionLocal()
+        try:
+            evaluate_pending_and_wait(db)
+        except Exception:
+            pass
+        finally:
+            db.close()
+
 
 # --- 事件推送逻辑 ---
 _event_queue = queue.Queue()
@@ -111,112 +289,62 @@ async def _sse_broadcast_loop():
         except queue.Empty:
             pass
 
-# --- 任务并发控制：每个 task_id 只允许一个实例在跑 ---
-_running_tasks: set = set()
-_running_lock = threading.Lock()
+# --- 消费者：认领 Runnable、创建 Run、执行脚本、更新队列 ---
+def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, run_date: datetime.date) -> str:
+    """
+    执行已存在的 Run 对应脚本。假定 Run 已创建且上游已满足。
+    若执行前再次检查发现上游未完成，返回 "Wait"；否则执行并返回终态 "Success"|"Failed"|"Stopped"。
+    """
+    run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not run or not task:
+        return "Failed"
+    task_dir = _get_task_dir(task)
+    script_path = task_dir / "script" / task.script_name
+    run_output_dir = Path(run.output_path) if run.output_path else task_dir / "output" / run_id
+    run_output_dir = run_output_dir if run_output_dir.is_absolute() else task_dir / "output" / run_id
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run.log_path
+    log_file = task_dir / log_path if not Path(log_path or "").is_absolute() else Path(log_path)
 
-def execute_factor_task(task_id: str, trigger_type: str = "cron"):
-    with _running_lock:
-        if task_id in _running_tasks:
-            return  # 已有实例在跑，跳过
-        _running_tasks.add(task_id)
-    try:
-        _do_execute_task(task_id, trigger_type)
-    finally:
-        with _running_lock:
-            _running_tasks.discard(task_id)
-
-def _do_execute_task(task_id: str, trigger_type: str):
-    db = SessionLocal()
-    run = None
-    task = None
-    start_time = datetime.datetime.now()
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            return
-        if task.status == "Running":
-            with _task_process_lock:
-                existing_proc = _task_processes.get(task_id)
-            if existing_proc and existing_proc.poll() is None:
-                return
-
-        task_dir = DATA_ROOT / task_id
-        script_path = task_dir / "script" / task.script_name
-        run_id = str(uuid.uuid4())
-        run_date = datetime.date.today()
-        run_output_dir = task_dir / "output" / run_id
-        run_output_dir.mkdir(parents=True, exist_ok=True)
-        last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
-        log_dir = task_dir / "logs"
-        log_dir.mkdir(exist_ok=True)
-        log_filename = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
-        log_file = task_dir / "logs" / log_filename
-        run = Run(
-            id=run_id,
-            task_id=task_id,
-            trigger_type=trigger_type,
-            status="Running",
-            start_time=start_time,
-            run_date=run_date,
-            log_path=str(Path("logs") / log_filename),
-            attempt=last_attempt + 1,
-            output_path=str(run_output_dir),
-        )
-        db.add(run)
-        task.status = "Running"
-        task.last_run = run_id
-        db.commit()
-
-        upstream_output_path = ""
-        if task.upstream_id:
-            upstream_run = (
-                db.query(Run)
-                .filter(
-                    Run.task_id == task.upstream_id,
-                    Run.status == "Success",
-                    Run.run_date == run_date,
-                )
-                .order_by(Run.start_time.desc())
-                .first()
+    upstream_output_path = ""
+    if task.upstream_id:
+        upstream_run = (
+            db.query(Run)
+            .filter(
+                Run.task_id == task.upstream_id,
+                Run.status == "Success",
+                Run.run_date == run_date,
             )
-            if not upstream_run:
-                message = (
-                    f"Upstream task {task.upstream_id} has no successful run for {run_date}."
-                )
-                log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
-                    f.write(f"[SKIP] {message}\n")
-                run.status = "Skipped"
-                run.end_time = datetime.datetime.now()
-                run.message = message
-                task.status = "Skipped"
-                task.last_run = run_id
-                db.commit()
-                return
-            upstream_output_path = upstream_run.output_path
+            .order_by(Run.start_time.desc())
+            .first()
+        )
+        if not upstream_run:
+            return "Wait"
+        upstream_output_path = upstream_run.output_path or ""
 
-        env_vars = os.environ.copy()
-        env_vars.update({
-            "TASK_ID": task_id,
-            "OUTPUT_PATH": str(run_output_dir),
-            "UPSTREAM_OUTPUT_PATH": upstream_output_path
-        })
-
-        exit_code = None
-        status = "Failed"
+    env_vars = os.environ.copy()
+    env_vars.update({
+        "TASK_ID": task_id,
+        "OUTPUT_PATH": str(run_output_dir),
+        "UPSTREAM_OUTPUT_PATH": upstream_output_path,
+    })
+    start_time = run.start_time
+    exit_code = None
+    status = "Failed"
+    try:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
             process = subprocess.Popen(
                 f'conda run -n {task.conda_env} python -u "{script_path}"',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', env=env_vars,
-                start_new_session=True
+                text=True, encoding="utf-8", env=env_vars,
+                start_new_session=True,
             )
             with _task_process_lock:
                 _task_processes[task_id] = process
-            for line in process.stdout: f.write(line)
+            for line in process.stdout:
+                f.write(line)
             process.wait()
             with _task_process_lock:
                 was_stopped = task_id in _task_stop_requests
@@ -226,37 +354,150 @@ def _do_execute_task(task_id: str, trigger_type: str):
             else:
                 status = "Success" if process.returncode == 0 else "Failed"
             exit_code = process.returncode
-        end_time = datetime.datetime.now()
-        duration_ms = int((end_time - start_time).total_seconds() * 1000)
-        run.end_time = end_time
-        run.exit_code = exit_code
-        run.status = status
-        run.duration_ms = duration_ms
-        task.status = status
     except Exception as exc:
-        end_time = datetime.datetime.now()
-        duration_ms = int((end_time - start_time).total_seconds() * 1000)
-        if run:
-            run.end_time = end_time
-            run.status = "Failed"
-            run.duration_ms = duration_ms
-            run.message = f"Execution error: {exc}"
-        if task:
-            task.status = "Failed"
+        status = "Failed"
+        run.message = f"Execution error: {exc}"
     finally:
-        if run and run.end_time is None:
-            end_time = datetime.datetime.now()
-            run.status = "Failed"
-            run.end_time = end_time
-            run.exit_code = -1
-            run.duration_ms = int((end_time - run.start_time).total_seconds() * 1000)
-        db.commit()
-        db.close()
         with _task_process_lock:
             _task_processes.pop(task_id, None)
-        _event_queue.put_nowait("update")
+    end_time = datetime.datetime.now()
+    duration_ms = int((end_time - start_time).total_seconds() * 1000)
+    run.end_time = end_time
+    run.exit_code = exit_code
+    run.status = status
+    run.duration_ms = duration_ms
+    task.status = status
+    task.last_run = run_id
+    db.commit()
+    _event_queue.put_nowait("update")
+    return status
 
-# --- 调度器初始化 ---
+
+def _claim_runnable_job(db: Session):
+    """
+    认领一条 Runnable 且同一 task_id 无 Running 的队列表项。
+    返回 (JobQueue, True) 若认领成功并已置为 Running；返回 (None, False) 若无可认领。
+    """
+    running_task_ids = {
+        r[0] for r in db.query(JobQueue.task_id).filter(JobQueue.status == "Running").distinct().all()
+    }
+    candidates = (
+        db.query(JobQueue)
+        .filter(JobQueue.status == "Runnable")
+        .order_by(JobQueue.created_at)
+        .all()
+    )
+    candidate = next((j for j in candidates if j.task_id not in running_task_ids), None)
+    if not candidate:
+        return None, False
+    now = datetime.datetime.now()
+    rows = (
+        db.query(JobQueue)
+        .filter(JobQueue.id == candidate.id, JobQueue.status == "Runnable")
+        .update({"status": "Running", "updated_at": now}, synchronize_session=False)
+    )
+    db.commit()
+    if rows == 0:
+        return None, False
+    db.refresh(candidate)
+    return candidate, True
+
+
+def _consumer_worker():
+    """单个消费者线程：循环认领 Runnable、创建 Run、执行、更新队列。"""
+    while not _consumer_stop.is_set():
+        db = SessionLocal()
+        job = None
+        try:
+            job, claimed = _claim_runnable_job(db)
+            if not claimed or not job:
+                db.close()
+                _consumer_stop.wait(timeout=1.0)
+                continue
+            task_id = job.task_id
+            trigger_type = job.trigger_type
+            run_date = job.run_date
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                job.status = "Failed"
+                job.message = "Task not found"
+                job.updated_at = datetime.datetime.now()
+                db.commit()
+                db.close()
+                continue
+            if not _upstream_success_for_date(db, task.upstream_id, run_date) if task.upstream_id else False:
+                job.status = "Wait"
+                job.updated_at = datetime.datetime.now()
+                db.commit()
+                db.close()
+                _event_queue.put_nowait("update")
+                continue
+            start_time = datetime.datetime.now()
+            run_id = str(uuid.uuid4())
+            task_dir = _get_task_dir(task)
+            run_output_dir = task_dir / "output" / run_id
+            run_output_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = task_dir / "logs"
+            log_dir.mkdir(exist_ok=True)
+            log_filename = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
+            log_path = str(Path("logs") / log_filename)
+            last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
+            run = Run(
+                id=run_id,
+                task_id=task_id,
+                trigger_type=trigger_type,
+                status="Running",
+                start_time=start_time,
+                run_date=run_date,
+                log_path=log_path,
+                attempt=last_attempt + 1,
+                output_path=str(run_output_dir),
+            )
+            db.add(run)
+            task.status = "Running"
+            task.last_run = run_id
+            job.run_id = run_id
+            db.commit()
+            final_status = _run_task_script(db, task_id, run_id, trigger_type, run_date)
+            if final_status == "Wait":
+                job.status = "Wait"
+                run = db.query(Run).filter(Run.id == run_id).first()
+                if run:
+                    run.status = "Failed"
+                    run.end_time = datetime.datetime.now()
+                    run.message = "Upstream not ready (race)"
+                db.commit()
+            else:
+                job.status = final_status
+                job.updated_at = datetime.datetime.now()
+                db.commit()
+        except Exception as e:
+            if job:
+                job.status = "Failed"
+                job.message = str(e)
+                job.updated_at = datetime.datetime.now()
+                try:
+                    db.commit()
+                except Exception:
+                    pass
+            try:
+                db.close()
+            except Exception:
+                pass
+        else:
+            db.close()
+        _event_queue.put_nowait("update")
+        if not _consumer_stop.is_set():
+            time.sleep(0.1)
+
+# --- 调度器初始化（清空旧 job 表，不再兼容 execute_factor_task）---
+from sqlalchemy import text
+try:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM apscheduler_jobs"))
+        conn.commit()
+except Exception:
+    pass  # 表不存在或首次运行则忽略
 scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=engine)})
 scheduler.start()
 
@@ -268,6 +509,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def favicon():
     return FileResponse(BASE_DIR / "static" / "favicon.ico")
 
+_eval_thread: Optional[threading.Thread] = None
+_consumer_threads: list = []
+
+
 @app.on_event("startup")
 async def startup():
     # 将上次崩溃时残留的 Running 任务置为 Unknown，由使用者看日志排查
@@ -275,13 +520,22 @@ async def startup():
     try:
         db.query(Task).filter(Task.status == "Running").update({"status": "Unknown"}, synchronize_session=False)
         db.query(Run).filter(Run.status == "Running").update({"status": "Unknown"}, synchronize_session=False)
+        db.query(JobQueue).filter(JobQueue.status == "Running").update({"status": "Runnable"}, synchronize_session=False)
         db.commit()
     finally:
         db.close()
+    global _eval_thread, _consumer_threads
+    _eval_thread = threading.Thread(target=_eval_loop, daemon=True)
+    _eval_thread.start()
+    for _ in range(QUEUE_WORKER_CONCURRENCY):
+        t = threading.Thread(target=_consumer_worker, daemon=True)
+        t.start()
+        _consumer_threads.append(t)
     asyncio.create_task(_sse_broadcast_loop())
 
 @app.on_event("shutdown")
 def on_shutdown():
+    _consumer_stop.set()
     try:
         scheduler.shutdown(wait=False)
     except Exception:
@@ -426,16 +680,23 @@ async def create_task(
     db: Session = Depends(get_db)
 ):
     task_id = str(uuid.uuid4())
-    task_dir = DATA_ROOT / task_id
-    for sub in ["script", "logs", "output"]: (task_dir / sub).mkdir(parents=True)
-    
-    with open(task_dir / "script" / file.filename, "wb") as f: f.write(await file.read())
+    base_folder = _sanitize_task_folder_name(name)
+    folder_name = _ensure_unique_task_folder_name(base_folder)
+    task_dir = DATA_ROOT / folder_name
+    for sub in ["script", "logs", "output"]:
+        (task_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    new_task = Task(id=task_id, name=name, script_name=file.filename, conda_env=conda_env, cron_time=time, upstream_id=upstream_id)
+    with open(task_dir / "script" / file.filename, "wb") as f:
+        f.write(await file.read())
+
+    new_task = Task(
+        id=task_id, name=name, folder_name=folder_name,
+        script_name=file.filename, conda_env=conda_env, cron_time=time, upstream_id=upstream_id,
+    )
     db.add(new_task); db.commit()
     
     h, m = time.split(":")
-    scheduler.add_job(execute_factor_task, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
+    scheduler.add_job(enqueue_job, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
     _event_queue.put_nowait("changed")
     return {"id": task_id}
 
@@ -444,29 +705,91 @@ async def delete_task(task_id: str, bg: BackgroundTasks, db: Session = Depends(g
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
+
+    task_dir = _get_task_dir(task)
     # 1. 立即从数据库和调度器中移除
-    db.delete(task); db.commit()
-    if scheduler.get_job(task_id): scheduler.remove_job(task_id)
-    
+    db.delete(task)
+    db.commit()
+    if scheduler.get_job(task_id):
+        scheduler.remove_job(task_id)
+
     # 2. 物理删除交给后台，不阻塞 API 响应，防止死锁
-    bg.add_task(shutil.rmtree, DATA_ROOT / task_id, ignore_errors=True)
+    bg.add_task(shutil.rmtree, task_dir, ignore_errors=True)
     
     _event_queue.put_nowait("changed")
     return {"status": "success"}
+
+@app.get("/api/queue")
+def list_queue(limit: int = 100, db: Session = Depends(get_db)):
+    """返回 status 为 Pending/Wait/Runnable（及 Running）的队列表项，便于排查。"""
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    jobs = (
+        db.query(JobQueue)
+        .filter(JobQueue.status.in_(["Pending", "Wait", "Runnable", "Running"]))
+        .order_by(JobQueue.created_at.desc())
+        .limit(min(limit, 500))
+        .all()
+    )
+    task_ids = {j.task_id for j in jobs}
+    tasks = {t.id: t for t in db.query(Task).filter(Task.id.in_(task_ids)).all()} if task_ids else {}
+    return [
+        {
+            "id": j.id,
+            "task_id": j.task_id,
+            "task_name": tasks.get(j.task_id).name if tasks.get(j.task_id) else "-",
+            "trigger_type": j.trigger_type,
+            "run_date": j.run_date.isoformat() if j.run_date else None,
+            "status": j.status,
+            "created_at": j.created_at.strftime("%Y-%m-%d %H:%M:%S") if j.created_at else None,
+            "updated_at": j.updated_at.strftime("%Y-%m-%d %H:%M:%S") if j.updated_at else None,
+        }
+        for j in jobs
+    ]
+
+
+@app.post("/api/queue/{job_id}/cancel")
+def cancel_queue_job(job_id: str, db: Session = Depends(get_db)):
+    """未执行则从队列移除，执行中则杀掉进程。"""
+    job = db.query(JobQueue).filter(JobQueue.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Queue job not found")
+    if job.status in ("Pending", "Wait", "Runnable"):
+        db.delete(job)
+        db.commit()
+        _event_queue.put_nowait("update")
+        return {"status": "cancelled"}
+    if job.status == "Running":
+        task_id = job.task_id
+        with _task_process_lock:
+            process = _task_processes.get(task_id)
+            if process and process.poll() is None:
+                _task_stop_requests.add(task_id)
+            else:
+                process = None
+        if process:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                process.kill()
+        job.status = "Stopped"
+        job.updated_at = datetime.datetime.now()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task:
+            task.status = "Stopped"
+        db.commit()
+        _event_queue.put_nowait("update")
+        return {"status": "stopped"}
+    raise HTTPException(status_code=400, detail="Job already finished")
+
 
 @app.post("/api/run_now/{task_id}")
 def run_now(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status == "Running":
-        raise HTTPException(status_code=400, detail="Task is already running")
-    task.status = "Running"
-    db.commit()
-    scheduler.add_job(execute_factor_task, args=[task_id, "manual"], id=f"{task_id}_manual")
-    _event_queue.put_nowait("changed")
-    return {"status": "triggered"}
+    enqueue_job(task_id, "manual")
+    return {"status": "queued"}
 
 @app.post("/api/stop/{task_id}")
 def stop_task(task_id: str, db: Session = Depends(get_db)):
@@ -492,7 +815,11 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
 
 @app.get("/api/logs/{task_id}")
 def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(get_db)):
-    log_dir = DATA_ROOT / task_id / "logs"
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task_dir = _get_task_dir(task)
+    log_dir = task_dir / "logs"
     if not log_dir.exists():
         return {"content": "暂无日志数据。", "run_id": None}
     if run_id:
@@ -501,7 +828,7 @@ def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(ge
             return {"content": "未找到对应运行记录。", "run_id": None}
         log_file = Path(run.log_path or "")
         if not log_file.is_absolute():
-            log_file = DATA_ROOT / task_id / log_file
+            log_file = task_dir / log_file
         if log_file.exists():
             return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
         return {"content": "日志文件不存在。", "run_id": run.id}
@@ -510,7 +837,7 @@ def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(ge
     if run:
         log_file = Path(run.log_path or "")
         if not log_file.is_absolute():
-            log_file = DATA_ROOT / task_id / log_file
+            log_file = task_dir / log_file
         if log_file.exists():
             return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
         return {"content": "日志文件不存在。", "run_id": run.id}

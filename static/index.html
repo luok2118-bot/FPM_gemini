@@ -354,12 +354,40 @@
 
                     <el-table-column prop="last_run" label="上次执行" width="180"></el-table-column>
 
-                    <el-table-column label="操作" width="300" align="right">
+                    <el-table-column label="操作" width="240" align="right">
                         <template #default="scope">
-                            <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row.id)" :loading="scope.row.status === 'Running'" title="立即运行"></el-button>
-                            <el-button circle type="warning" plain :icon="CircleClose" @click="stopTask(scope.row)" :disabled="scope.row.status !== 'Running'" title="强制中止"></el-button>
+                            <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row)" :loading="scope.row.status === 'Running'" title="立即运行"></el-button>
                             <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)" title="查看日志"></el-button>
                             <el-button circle type="danger" plain :icon="Delete" @click="deleteTask(scope.row)" title="删除任务"></el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+            </div>
+
+            <div class="modern-card" v-if="queueItems.length > 0" style="margin-top: 20px;">
+                <div style="margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+                    <h3 style="margin: 0; font-weight: 600;">任务队列</h3>
+                    <el-button circle plain @click="fetchQueue" size="small">
+                        <el-icon><refresh></refresh></el-icon>
+                    </el-button>
+                </div>
+                <el-table :data="queueItems" size="small" v-loading="queueLoading" max-height="220">
+                    <el-table-column prop="task_name" label="任务名称" min-width="140"></el-table-column>
+                    <el-table-column prop="trigger_type" label="触发" width="80"></el-table-column>
+                    <el-table-column prop="status" label="状态" width="100">
+                        <template #default="scope">
+                            <el-tag size="small" :type="scope.row.status === 'Running' ? 'success' : scope.row.status === 'Runnable' ? 'primary' : scope.row.status === 'Wait' ? 'warning' : 'info'">
+                                {{ scope.row.status }}
+                            </el-tag>
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="run_date" label="运行日" width="110"></el-table-column>
+                    <el-table-column prop="created_at" label="入队时间" width="170"></el-table-column>
+                    <el-table-column label="操作" width="90" align="right">
+                        <template #default="scope">
+                            <el-button type="warning" plain size="small" :icon="CircleClose" @click="cancelQueueJob(scope.row)" title="终止">
+                                终止
+                            </el-button>
                         </template>
                     </el-table-column>
                 </el-table>
@@ -516,6 +544,8 @@
                     const selectedFile = ref(null);
                     const runs = ref([]);
                     const runsLoading = ref(false);
+                    const queueItems = ref([]);
+                    const queueLoading = ref(false);
                     
                     const currentTaskId = ref(null);
                     const currentTaskName = ref("");
@@ -554,6 +584,18 @@
                         } catch(e) { envs.value = ['base']; }
                     };
 
+                    const fetchQueue = async () => {
+                        queueLoading.value = true;
+                        try {
+                            const res = await axios.get('/api/queue', { params: { limit: 100 } });
+                            queueItems.value = res.data || [];
+                        } catch (e) {
+                            queueItems.value = [];
+                        } finally {
+                            queueLoading.value = false;
+                        }
+                    };
+
                     const handleFileChange = (file) => {
                         selectedFile.value = file.raw;
                     };
@@ -579,14 +621,35 @@
                         } catch(e) { ElementPlus.ElMessage.error('创建失败'); }
                     };
 
-                    const runNow = async (id) => {
+                    const esc = (s) => { if (s == null || s === undefined) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
+                    const runNow = async (row) => {
                         try {
-                            await axios.post(`/api/run_now/${id}`);
+                            const msg = '<div style="line-height:1.75;color:#374151;">' +
+                                '<p style="margin:0 0 12px 0;font-size:13px;color:#6b7280;">确认后任务将加入队列，并按依赖顺序执行。</p>' +
+                                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb;">' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">任务名称</strong><br/><span style="font-size:14px;">' + esc(row.name) + '</span></div>' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">脚本</strong><br/><span style="font-size:14px;">' + esc(row.script || '-') + '</span></div>' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">环境</strong><br/><span style="font-size:14px;">' + esc(row.env || '-') + '</span></div>' +
+                                '<div style="margin-bottom:0;"><strong style="font-size:12px;color:#9ca3af;">调度</strong><br/><span style="font-size:14px;">每天 ' + esc(row.schedule || '-') + '</span></div>' +
+                                '</div></div>';
+                            await ElementPlus.ElMessageBox.confirm(
+                                msg,
+                                '立即运行确认',
+                                { type: 'info', confirmButtonText: '立即运行', cancelButtonText: '取消', dangerouslyUseHTMLString: true }
+                            );
+                            const res = await axios.post(`/api/run_now/${row.id}`);
                             fetchTasks(false);
-                            ElementPlus.ElMessage.info('后台计算已触发');
+                            if (res.data?.status === 'queued') {
+                                ElementPlus.ElMessage.success('已加入队列');
+                            } else {
+                                ElementPlus.ElMessage.info('已提交');
+                            }
+                            fetchQueue();
                         } catch (e) {
-                            ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '触发失败');
-                            fetchTasks(false);
+                            if (e !== 'cancel') {
+                                ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '触发失败');
+                                fetchTasks(false);
+                            }
                         }
                     };
 
@@ -672,16 +735,49 @@
                     const stopTask = async (row) => {
                         try {
                             await ElementPlus.ElMessageBox.confirm(
-                                `确认强制中止任务「${row.name}」吗？该操作会直接终止进程。`,
-                                '强制中止确认',
-                                { type: 'warning', confirmButtonText: '中止', cancelButtonText: '取消' }
+                                `确认强制终止任务「${row.name}」吗？该操作会直接终止进程。`,
+                                '终止确认',
+                                { type: 'warning', confirmButtonText: '终止', cancelButtonText: '取消' }
                             );
                             await axios.post(`/api/stop/${row.id}`);
-                            ElementPlus.ElMessage.success('任务已中止');
+                            ElementPlus.ElMessage.success('任务已终止');
                             fetchTasks(false);
                         } catch (e) {
                             if (e !== 'cancel') {
-                                ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '中止失败');
+                                ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '终止失败');
+                            }
+                        }
+                    };
+
+                    const cancelQueueJob = async (row) => {
+                        try {
+                            const statusTip = row.status === 'Running' ? '当前正在执行，确认后将终止进程。' : '尚未执行，确认将从队列中移除。';
+                            const msg = '<div style="line-height:1.75;color:#374151;">' +
+                                '<p style="margin:0 0 12px 0;font-size:13px;color:#6b7280;">' + esc(statusTip) + '</p>' +
+                                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb;">' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">任务名称</strong><br/><span style="font-size:14px;">' + esc(row.task_name || '-') + '</span></div>' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">触发方式</strong><br/><span style="font-size:14px;">' + esc(row.trigger_type || '-') + '</span></div>' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">状态</strong><br/><span style="font-size:14px;">' + esc(row.status || '-') + '</span></div>' +
+                                '<div style="margin-bottom:8px;"><strong style="font-size:12px;color:#9ca3af;">运行日</strong><br/><span style="font-size:14px;">' + esc(row.run_date || '-') + '</span></div>' +
+                                '<div style="margin-bottom:0;"><strong style="font-size:12px;color:#9ca3af;">入队时间</strong><br/><span style="font-size:14px;">' + esc(row.created_at || '-') + '</span></div>' +
+                                '</div></div>';
+                            await ElementPlus.ElMessageBox.confirm(
+                                msg,
+                                '终止确认',
+                                { type: 'warning', confirmButtonText: '终止', cancelButtonText: '取消', dangerouslyUseHTMLString: true }
+                            );
+                            const res = await axios.post(`/api/queue/${row.id}/cancel`);
+                            if (res.data?.status === 'cancelled') {
+                                ElementPlus.ElMessage.success('已从队列移除');
+                            } else if (res.data?.status === 'stopped') {
+                                ElementPlus.ElMessage.success('任务已终止');
+                            }
+                            fetchQueue();
+                            fetchTasks(false);
+                        } catch (e) {
+                            if (e !== 'cancel') {
+                                ElementPlus.ElMessage.error(e?.response?.data?.detail || e?.response?.data?.message || '操作失败');
+                                fetchQueue();
                             }
                         }
                     };
@@ -689,6 +785,7 @@
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
+                        fetchQueue();
                         // SSE 推送：节流刷新（1 秒内最多一次），断线/空闲超时自动重连
                         let lastRefresh = 0;
                         let lastSSEMessageAt = Date.now();
@@ -700,6 +797,7 @@
                         const doRefresh = () => {
                             if (!loading.value) {
                                 fetchTasks(false);
+                                fetchQueue();
                                 lastRefresh = Date.now();
                             }
                         };
@@ -745,10 +843,10 @@
 
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
-                        runs, runsLoading,
+                        runs, runsLoading, queueItems, queueLoading, fetchQueue,
                         currentTaskName, currentEnv, logContent, currentRunId, nowTick,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, fetchTasks,
-                        getElapsedSeconds, formatDuration, stopTask,
+                        getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
                         deleteTask
                     };
