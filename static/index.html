@@ -94,6 +94,7 @@
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             color: var(--text-main);
             -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
         }
 
         [v-cloak] { display: none; } 
@@ -110,7 +111,7 @@
         }
 
         .header-content {
-            max-width: 1200px;
+            max-width: 1440px;
             margin: 0 auto;
             height: 100%;
             display: flex;
@@ -134,7 +135,8 @@
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1440px;
+            width: min(1440px, 100%);
             margin: 30px auto;
             padding: 0 20px;
         }
