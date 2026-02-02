@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, Float, event, func
+from sqlalchemy import create_engine, Column, String, DateTime, Date, Integer, Float, event, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -70,6 +70,9 @@ class Run(Base):
     log_path = Column(String)
     attempt = Column(Integer, default=1)
     duration_ms = Column(Integer, nullable=True)
+    run_date = Column(Date, nullable=True)
+    output_path = Column(String, nullable=True)
+    message = Column(String, nullable=True)
 
 class TaskRun(Base):
     __tablename__ = "task_runs"
@@ -140,15 +143,11 @@ def _do_execute_task(task_id: str, trigger_type: str):
 
         task_dir = DATA_ROOT / task_id
         script_path = task_dir / "script" / task.script_name
-        env_vars = os.environ.copy()
-        env_vars.update({
-            "TASK_ID": task_id,
-            "OUTPUT_PATH": str(task_dir / "output"),
-            "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
-        })
-
-        last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
         run_id = str(uuid.uuid4())
+        run_date = datetime.date.today()
+        run_output_dir = task_dir / "output" / run_id
+        run_output_dir.mkdir(parents=True, exist_ok=True)
+        last_attempt = db.query(func.max(Run.attempt)).filter(Run.task_id == task_id).scalar() or 0
         log_dir = task_dir / "logs"
         log_dir.mkdir(exist_ok=True)
         log_filename = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
@@ -159,14 +158,51 @@ def _do_execute_task(task_id: str, trigger_type: str):
             trigger_type=trigger_type,
             status="Running",
             start_time=start_time,
+            run_date=run_date,
             log_path=str(Path("logs") / log_filename),
             attempt=last_attempt + 1,
+            output_path=str(run_output_dir),
         )
         db.add(run)
-
         task.status = "Running"
         task.last_run = run_id
         db.commit()
+
+        upstream_output_path = ""
+        if task.upstream_id:
+            upstream_run = (
+                db.query(Run)
+                .filter(
+                    Run.task_id == task.upstream_id,
+                    Run.status == "Success",
+                    Run.run_date == run_date,
+                )
+                .order_by(Run.start_time.desc())
+                .first()
+            )
+            if not upstream_run:
+                message = (
+                    f"Upstream task {task.upstream_id} has no successful run for {run_date}."
+                )
+                log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+                    f.write(f"[SKIP] {message}\n")
+                run.status = "Skipped"
+                run.end_time = datetime.datetime.now()
+                run.message = message
+                task.status = "Skipped"
+                task.last_run = run_id
+                db.commit()
+                return
+            upstream_output_path = upstream_run.output_path
+
+        env_vars = os.environ.copy()
+        env_vars.update({
+            "TASK_ID": task_id,
+            "OUTPUT_PATH": str(run_output_dir),
+            "UPSTREAM_OUTPUT_PATH": upstream_output_path
+        })
 
         exit_code = None
         status = "Failed"
@@ -197,13 +233,14 @@ def _do_execute_task(task_id: str, trigger_type: str):
         run.status = status
         run.duration_ms = duration_ms
         task.status = status
-    except Exception:
+    except Exception as exc:
         end_time = datetime.datetime.now()
         duration_ms = int((end_time - start_time).total_seconds() * 1000)
         if run:
             run.end_time = end_time
             run.status = "Failed"
             run.duration_ms = duration_ms
+            run.message = f"Execution error: {exc}"
         if task:
             task.status = "Failed"
     finally:
