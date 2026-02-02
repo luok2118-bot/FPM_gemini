@@ -56,6 +56,15 @@ class Task(Base):
     status = Column(String, default="Idle")
     last_run = Column(DateTime, nullable=True)
 
+class Run(Base):
+    __tablename__ = "runs"
+    id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    status = Column(String, default="Running")
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    log_path = Column(String, nullable=True)
+
 Base.metadata.create_all(bind=engine)
 
 # --- 事件推送逻辑 ---
@@ -109,11 +118,25 @@ def _do_execute_task(task_id: str):
             "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
         })
 
+        now = datetime.datetime.now()
+        run_id = str(uuid.uuid4())
+        log_dir = task_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
+        run = Run(
+            id=run_id,
+            task_id=task_id,
+            status="Running",
+            started_at=now,
+            log_path=str(Path("logs") / log_filename),
+        )
+        db.add(run)
+
         task.status = "Running"
-        task.last_run = datetime.datetime.now()
+        task.last_run = now
         db.commit()
 
-        log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
+        log_file = task_dir / "logs" / log_filename
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
             process = subprocess.Popen(
@@ -124,6 +147,8 @@ def _do_execute_task(task_id: str):
             for line in process.stdout: f.write(line)
             process.wait()
             task.status = "Success" if process.returncode == 0 else "Failed"
+            run.status = task.status
+            run.finished_at = datetime.datetime.now()
     finally:
         db.commit()
         db.close()
@@ -278,22 +303,53 @@ def run_now(task_id: str, db: Session = Depends(get_db)):
     return {"status": "triggered"}
 
 @app.get("/api/logs/{task_id}")
-def get_log(task_id: str, date: Optional[str] = None):
+def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(get_db)):
     log_dir = DATA_ROOT / task_id / "logs"
     if not log_dir.exists():
-        return {"content": "暂无日志数据。", "date": None}
-    if date:
-        log_file = log_dir / f"{date}.log"
+        return {"content": "暂无日志数据。", "run_id": None}
+    if run_id:
+        run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+        if not run:
+            return {"content": "未找到对应运行记录。", "run_id": None}
+        log_file = Path(run.log_path or "")
+        if not log_file.is_absolute():
+            log_file = DATA_ROOT / task_id / log_file
         if log_file.exists():
-            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "date": date}
-        return {"content": "该日期无日志。", "date": None}
-    # 无 date 时返回修改时间最新的一份日志
+            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
+        return {"content": "日志文件不存在。", "run_id": run.id}
+
+    run = db.query(Run).filter(Run.task_id == task_id).order_by(Run.started_at.desc()).first()
+    if run:
+        log_file = Path(run.log_path or "")
+        if not log_file.is_absolute():
+            log_file = DATA_ROOT / task_id / log_file
+        if log_file.exists():
+            return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
+        return {"content": "日志文件不存在。", "run_id": run.id}
+
     log_files = list(log_dir.glob("*.log"))
     if not log_files:
-        return {"content": "暂无日志数据。", "date": None}
+        return {"content": "暂无日志数据。", "run_id": None}
     latest = max(log_files, key=lambda p: p.stat().st_mtime)
-    date_str = latest.stem
-    return {"content": latest.read_text(encoding="utf-8", errors="replace"), "date": date_str}
+    return {"content": latest.read_text(encoding="utf-8", errors="replace"), "run_id": None}
+
+@app.get("/api/runs/{task_id}")
+def list_runs(task_id: str, db: Session = Depends(get_db)):
+    runs = (
+        db.query(Run)
+        .filter(Run.task_id == task_id)
+        .order_by(Run.started_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": run.id,
+            "status": run.status,
+            "started_at": run.started_at.strftime("%Y-%m-%d %H:%M:%S") if run.started_at else None,
+            "log_path": run.log_path,
+        }
+        for run in runs
+    ]
 
 @app.get("/")
 def index(): return FileResponse("static/index.html")

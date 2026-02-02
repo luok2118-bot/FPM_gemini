@@ -424,7 +424,22 @@
         <el-dialog v-model="logVisible" :title="currentTaskName" width="850px">
             <div class="log-container">
                 <div class="log-header">
-                    <span>Terminal Output{{ currentLogDate ? ' · ' + currentLogDate : '' }}</span>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <span>Terminal Output</span>
+                        <el-select
+                            v-model="currentRunId"
+                            size="small"
+                            placeholder="选择运行记录"
+                            style="min-width: 240px;"
+                            @change="fetchLog">
+                            <el-option
+                                v-for="run in runs"
+                                :key="run.id"
+                                :label="`${run.started_at || run.id} (${run.status})`"
+                                :value="run.id">
+                            </el-option>
+                        </el-select>
+                    </div>
                     <span>Env: {{ currentEnv }}</span>
                 </div>
                 <div class="log-content">{{ logContent }}</div>
@@ -455,7 +470,8 @@
                     const currentTaskName = ref("");
                     const currentEnv = ref("");
                     const logContent = ref("");
-                    const currentLogDate = ref("");
+                    const runs = ref([]);
+                    const currentRunId = ref("");
 
                     const form = reactive({ name: '', env: '', time: '', upstream_id: '' });
 
@@ -547,17 +563,29 @@
                         currentTaskName.value = row.name;
                         currentEnv.value = row.env;
                         logVisible.value = true;
+                        await fetchRuns();
                         fetchLog();
+                    };
+
+                    const fetchRuns = async () => {
+                        if (!currentTaskId.value) return;
+                        try {
+                            const res = await axios.get(`/api/runs/${currentTaskId.value}`);
+                            runs.value = res.data;
+                            currentRunId.value = runs.value.length ? runs.value[0].id : "";
+                        } catch (e) {
+                            runs.value = [];
+                            currentRunId.value = "";
+                        }
                     };
 
                     const fetchLog = async () => {
                         if(!currentTaskId.value) return;
                         logContent.value = "Loading...";
-                        currentLogDate.value = "";
                         try {
-                            const res = await axios.get(`/api/logs/${currentTaskId.value}`);
+                            const config = currentRunId.value ? { params: { run_id: currentRunId.value } } : {};
+                            const res = await axios.get(`/api/logs/${currentTaskId.value}`, config);
                             logContent.value = res.data.content;
-                            currentLogDate.value = res.data.date || "";
                         } catch(e) { logContent.value = "暂无日志数据"; }
                     };
 
@@ -616,8 +644,8 @@
 
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
-                        currentTaskName, currentEnv, logContent, currentLogDate,
-                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
+                        currentTaskName, currentEnv, logContent, runs, currentRunId,
+                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, fetchTasks,
                         Plus, VideoPlay, Document, Refresh, Delete,
                         deleteTask
                     };
