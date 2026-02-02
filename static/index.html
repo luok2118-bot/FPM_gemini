@@ -230,6 +230,21 @@
             font-size: 13px;
             white-space: pre-wrap;
         }
+
+        .runs-panel {
+            margin-bottom: 12px;
+        }
+
+        .runs-panel .el-table {
+            --el-table-header-bg-color: #111827;
+            --el-table-header-text-color: #e5e7eb;
+            --el-table-row-hover-bg-color: #1f2937;
+            background: #0f172a;
+        }
+
+        .run-log-button {
+            font-size: 12px;
+        }
         
         .env-tag {
             background: #f3f4f6;
@@ -421,7 +436,27 @@
             </template>
         </el-dialog>
 
-        <el-dialog v-model="logVisible" :title="currentTaskName" width="850px">
+        <el-dialog v-model="logVisible" :title="currentTaskName" width="900px">
+            <div class="runs-panel">
+                <el-table :data="runs" height="200" size="small" v-loading="runsLoading">
+                    <el-table-column prop="start_time" label="开始时间" width="170"></el-table-column>
+                    <el-table-column prop="status" label="状态" width="110"></el-table-column>
+                    <el-table-column prop="duration" label="耗时(s)" width="100">
+                        <template #default="scope">
+                            {{ scope.row.duration ? scope.row.duration.toFixed(2) : '-' }}
+                        </template>
+                    </el-table-column>
+                    <el-table-column prop="exit_code" label="退出码" width="80"></el-table-column>
+                    <el-table-column prop="log_path" label="日志路径"></el-table-column>
+                    <el-table-column label="操作" width="110">
+                        <template #default="scope">
+                            <el-button type="primary" text class="run-log-button" @click="fetchLogForRun(scope.row)">
+                                查看日志
+                            </el-button>
+                        </template>
+                    </el-table-column>
+                </el-table>
+            </div>
             <div class="log-container">
                 <div class="log-header">
                     <span>Terminal Output{{ currentLogDate ? ' · ' + currentLogDate : '' }}</span>
@@ -450,6 +485,8 @@
                     const dialogVisible = ref(false);
                     const logVisible = ref(false);
                     const selectedFile = ref(null);
+                    const runs = ref([]);
+                    const runsLoading = ref(false);
                     
                     const currentTaskId = ref(null);
                     const currentTaskName = ref("");
@@ -547,18 +584,49 @@
                         currentTaskName.value = row.name;
                         currentEnv.value = row.env;
                         logVisible.value = true;
-                        fetchLog();
+                        await fetchRuns();
                     };
 
-                    const fetchLog = async () => {
+                    const parseLogDate = (logPath) => {
+                        if (!logPath) return null;
+                        const fileName = logPath.split('/').pop() || '';
+                        if (!fileName.endsWith('.log')) return null;
+                        return fileName.replace('.log', '');
+                    };
+
+                    const fetchLog = async (date) => {
                         if(!currentTaskId.value) return;
                         logContent.value = "Loading...";
                         currentLogDate.value = "";
                         try {
-                            const res = await axios.get(`/api/logs/${currentTaskId.value}`);
+                            const res = await axios.get(`/api/logs/${currentTaskId.value}`, { params: date ? { date } : {} });
                             logContent.value = res.data.content;
                             currentLogDate.value = res.data.date || "";
                         } catch(e) { logContent.value = "暂无日志数据"; }
+                    };
+
+                    const fetchLogForRun = async (run) => {
+                        const date = parseLogDate(run.log_path);
+                        await fetchLog(date);
+                    };
+
+                    const fetchRuns = async () => {
+                        if (!currentTaskId.value) return;
+                        runsLoading.value = true;
+                        try {
+                            const res = await axios.get(`/api/tasks/${currentTaskId.value}/runs`, { params: { limit: 20 } });
+                            runs.value = res.data;
+                            if (runs.value.length > 0) {
+                                await fetchLogForRun(runs.value[0]);
+                            } else {
+                                await fetchLog();
+                            }
+                        } catch (e) {
+                            runs.value = [];
+                            await fetchLog();
+                        } finally {
+                            runsLoading.value = false;
+                        }
                     };
 
                     onMounted(() => {
@@ -616,8 +684,9 @@
 
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
+                        runs, runsLoading,
                         currentTaskName, currentEnv, logContent, currentLogDate,
-                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchTasks,
+                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchLogForRun, fetchRuns, fetchTasks,
                         Plus, VideoPlay, Document, Refresh, Delete,
                         deleteTask
                     };

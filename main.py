@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, event
+from sqlalchemy import create_engine, Column, String, DateTime, Integer, Float, event
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -56,6 +56,17 @@ class Task(Base):
     status = Column(String, default="Idle")
     last_run = Column(DateTime, nullable=True)
 
+class TaskRun(Base):
+    __tablename__ = "task_runs"
+    run_id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    status = Column(String)
+    start_time = Column(DateTime)
+    end_time = Column(DateTime, nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    duration = Column(Float, nullable=True)
+    log_path = Column(String)
+
 Base.metadata.create_all(bind=engine)
 
 # --- 事件推送逻辑 ---
@@ -96,6 +107,7 @@ def execute_factor_task(task_id: str):
 
 def _do_execute_task(task_id: str):
     db = SessionLocal()
+    run = None
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task: return
@@ -109,11 +121,20 @@ def _do_execute_task(task_id: str):
             "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
         })
 
+        start_time = datetime.datetime.now()
+        log_file = task_dir / "logs" / f"{start_time.strftime('%Y-%m-%d')}.log"
+        run = TaskRun(
+            run_id=str(uuid.uuid4()),
+            task_id=task_id,
+            status="Running",
+            start_time=start_time,
+            log_path=str(log_file.relative_to(BASE_DIR)),
+        )
+        db.add(run)
         task.status = "Running"
-        task.last_run = datetime.datetime.now()
+        task.last_run = start_time
         db.commit()
 
-        log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
             process = subprocess.Popen(
@@ -123,8 +144,21 @@ def _do_execute_task(task_id: str):
             )
             for line in process.stdout: f.write(line)
             process.wait()
-            task.status = "Success" if process.returncode == 0 else "Failed"
+            end_time = datetime.datetime.now()
+            status = "Success" if process.returncode == 0 else "Failed"
+            task.status = status
+            if run:
+                run.status = status
+                run.end_time = end_time
+                run.exit_code = process.returncode
+                run.duration = (end_time - run.start_time).total_seconds()
     finally:
+        if run and run.end_time is None:
+            end_time = datetime.datetime.now()
+            run.status = "Failed"
+            run.end_time = end_time
+            run.exit_code = -1
+            run.duration = (end_time - run.start_time).total_seconds()
         db.commit()
         db.close()
         _event_queue.put_nowait("update")
@@ -228,6 +262,45 @@ def list_tasks(db: Session = Depends(get_db)):
             "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
         })
     return res
+
+def _format_run(run: TaskRun):
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "start_time": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else None,
+        "end_time": run.end_time.strftime("%Y-%m-%d %H:%M:%S") if run.end_time else None,
+        "exit_code": run.exit_code,
+        "duration": run.duration,
+        "log_path": run.log_path,
+    }
+
+@app.get("/api/tasks/{task_id}/runs")
+def list_task_runs(task_id: str, limit: int = 20, db: Session = Depends(get_db)):
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    runs = (
+        db.query(TaskRun)
+        .filter(TaskRun.task_id == task_id)
+        .order_by(TaskRun.start_time.desc())
+        .limit(min(limit, 200))
+        .all()
+    )
+    return [_format_run(run) for run in runs]
+
+@app.get("/api/runs")
+def list_runs(limit: int = 50, db: Session = Depends(get_db)):
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
+    runs = (
+        db.query(TaskRun)
+        .order_by(TaskRun.start_time.desc())
+        .limit(min(limit, 500))
+        .all()
+    )
+    return [_format_run(run) for run in runs]
 
 @app.post("/api/tasks")
 async def create_task(
