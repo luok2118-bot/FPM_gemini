@@ -334,6 +334,17 @@
                         </template>
                     </el-table-column>
 
+                    <el-table-column label="任务类型" width="140">
+                        <template #default="scope">
+                            <el-tag size="small" :type="scope.row.task_type === 'market' ? 'success' : 'info'">
+                                {{ scope.row.task_type === 'market' ? '行情更新' : '因子计算' }}
+                            </el-tag>
+                            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
+                                非交易日{{ scope.row.run_on_non_trading ? '执行' : '不执行' }}
+                            </div>
+                        </template>
+                    </el-table-column>
+
                     <el-table-column label="运行状态" width="140">
                         <template #default="scope">
                             <div class="status-badge" :class="'state-' + scope.row.status">
@@ -396,7 +407,7 @@
 
         <el-dialog 
             v-model="dialogVisible" 
-            title="配置因子计算任务" 
+            title="配置任务" 
             width="540px" 
             append-to-body
             class="custom-dialog"
@@ -466,13 +477,32 @@
                         </el-form-item>
                     </el-col>
                 </el-row>
+                <el-row :gutter="20">
+                    <el-col :span="12">
+                        <el-form-item label="任务类型">
+                            <el-select v-model="form.task_type" placeholder="选择任务类型" style="width: 100%" size="large">
+                                <el-option label="行情更新任务" value="market"></el-option>
+                                <el-option label="因子计算任务" value="factor"></el-option>
+                            </el-select>
+                        </el-form-item>
+                    </el-col>
+                    <el-col :span="12">
+                        <el-form-item label="非交易日执行">
+                            <el-switch
+                                v-model="form.run_on_non_trading"
+                                active-text="执行"
+                                inactive-text="不执行"
+                                size="large" />
+                        </el-form-item>
+                    </el-col>
+                </el-row>
             </el-form>
         
             <template #footer>
                 <div class="dialog-footer">
                     <el-button @click="dialogVisible = false" size="large">取消</el-button>
                     <el-button type="primary" @click="createTask" size="large" class="glow-button">
-                        部署因子任务
+                        部署任务
                     </el-button>
                 </div>
             </template>
@@ -554,7 +584,14 @@
                     const currentRunId = ref("");
                     const nowTick = ref(Date.now());
 
-                    const form = reactive({ name: '', env: '', time: '', upstream_id: '' });
+                    const form = reactive({
+                        name: '',
+                        env: '',
+                        time: '',
+                        upstream_id: '',
+                        task_type: 'factor',
+                        run_on_non_trading: false,
+                    });
 
                     const fetchTasks = async (showLoading = true) => {
                         if (showLoading) loading.value = true;
@@ -601,7 +638,7 @@
                     };
 
                     const createTask = async () => {
-                        if(!form.name || !form.env || !form.time || !selectedFile.value) {
+                        if(!form.name || !form.env || !form.time || !form.task_type || !selectedFile.value) {
                             ElementPlus.ElMessage.warning('请完善任务信息、选择触发时间并上传脚本');
                             return;
                         }
@@ -609,6 +646,8 @@
                         fd.append('name', form.name);
                         fd.append('conda_env', form.env);
                         fd.append('time', form.time);
+                        fd.append('task_type', form.task_type);
+                        fd.append('run_on_non_trading', form.run_on_non_trading ? 'true' : 'false');
                         fd.append('file', selectedFile.value);
                         if (form.upstream_id) fd.append('upstream_id', form.upstream_id);
 
