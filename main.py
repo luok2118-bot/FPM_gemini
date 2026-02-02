@@ -6,6 +6,8 @@ import subprocess
 import threading
 import datetime
 import shutil
+import signal
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +64,9 @@ Base.metadata.create_all(bind=engine)
 _event_queue = queue.Queue()
 _sse_queues: set = set()
 _client_sse_queues: dict[str, asyncio.Queue] = {}
+_task_processes: dict[str, subprocess.Popen] = {}
+_task_stop_requests: set[str] = set()
+_task_process_lock = threading.Lock()
 
 async def _sse_broadcast_loop():
     # 事件内容仅作触发，不区分类型；取到即向所有 SSE 连接广播 refresh
@@ -99,6 +104,11 @@ def _do_execute_task(task_id: str):
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task: return
+        if task.status == "Running":
+            with _task_process_lock:
+                existing_proc = _task_processes.get(task_id)
+            if existing_proc and existing_proc.poll() is None:
+                return
 
         task_dir = DATA_ROOT / task_id
         script_path = task_dir / "script" / task.script_name
@@ -119,14 +129,25 @@ def _do_execute_task(task_id: str):
             process = subprocess.Popen(
                 f'conda run -n {task.conda_env} python -u "{script_path}"',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', env=env_vars
+                text=True, encoding='utf-8', env=env_vars,
+                start_new_session=True
             )
+            with _task_process_lock:
+                _task_processes[task_id] = process
             for line in process.stdout: f.write(line)
             process.wait()
-            task.status = "Success" if process.returncode == 0 else "Failed"
+            with _task_process_lock:
+                was_stopped = task_id in _task_stop_requests
+                _task_stop_requests.discard(task_id)
+            if was_stopped:
+                task.status = "Stopped"
+            else:
+                task.status = "Success" if process.returncode == 0 else "Failed"
     finally:
         db.commit()
         db.close()
+        with _task_process_lock:
+            _task_processes.pop(task_id, None)
         _event_queue.put_nowait("update")
 
 # --- 调度器初始化 ---
@@ -221,10 +242,12 @@ def list_tasks(db: Session = Depends(get_db)):
     res = []
     for t in tasks:
         job = scheduler.get_job(t.id)
+        last_run_ts = t.last_run.isoformat() if t.last_run else None
         res.append({
             "id": t.id, "name": t.name, "script": t.script_name,
             "env": t.conda_env, "schedule": t.cron_time, "status": t.status,
             "last_run": t.last_run.strftime("%Y-%m-%d %H:%M:%S") if t.last_run else "-",
+            "last_run_ts": last_run_ts,
             "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused"
         })
     return res
@@ -270,12 +293,36 @@ def run_now(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task.status == "Running":
+        raise HTTPException(status_code=400, detail="Task is already running")
     task.status = "Running"
     task.last_run = datetime.datetime.now()
     db.commit()
     scheduler.add_job(execute_factor_task, args=[task_id], id=f"{task_id}_manual")
     _event_queue.put_nowait("changed")
     return {"status": "triggered"}
+
+@app.post("/api/stop/{task_id}")
+def stop_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    with _task_process_lock:
+        process = _task_processes.get(task_id)
+        if process and process.poll() is None:
+            _task_stop_requests.add(task_id)
+        else:
+            process = None
+    if not process:
+        raise HTTPException(status_code=409, detail="Task is not running")
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        process.kill()
+    task.status = "Stopped"
+    db.commit()
+    _event_queue.put_nowait("changed")
+    return {"status": "stopped"}
 
 @app.get("/api/logs/{task_id}")
 def get_log(task_id: str, date: Optional[str] = None):
