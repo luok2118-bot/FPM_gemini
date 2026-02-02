@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, event
+from sqlalchemy import create_engine, Column, String, DateTime, Date, event
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -55,6 +55,17 @@ class Task(Base):
     upstream_id = Column(String, nullable=True)
     status = Column(String, default="Idle")
     last_run = Column(DateTime, nullable=True)
+
+class Run(Base):
+    __tablename__ = "runs"
+    id = Column(String, primary_key=True)
+    task_id = Column(String, index=True)
+    status = Column(String, default="Running")
+    run_date = Column(Date, index=True)
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    output_path = Column(String, nullable=False)
+    message = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -102,11 +113,55 @@ def _do_execute_task(task_id: str):
 
         task_dir = DATA_ROOT / task_id
         script_path = task_dir / "script" / task.script_name
+        run_id = str(uuid.uuid4())
+        run_date = datetime.date.today()
+        run_output_dir = task_dir / "output" / run_id
+        run_output_dir.mkdir(parents=True, exist_ok=True)
+        run = Run(
+            id=run_id,
+            task_id=task_id,
+            status="Running",
+            run_date=run_date,
+            started_at=datetime.datetime.now(),
+            output_path=str(run_output_dir),
+        )
+        db.add(run)
+        db.commit()
+
+        upstream_output_path = ""
+        if task.upstream_id:
+            upstream_run = (
+                db.query(Run)
+                .filter(
+                    Run.task_id == task.upstream_id,
+                    Run.status == "Success",
+                    Run.run_date == run_date,
+                )
+                .order_by(Run.started_at.desc())
+                .first()
+            )
+            if not upstream_run:
+                message = (
+                    f"Upstream task {task.upstream_id} has no successful run for {run_date}."
+                )
+                log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+                    f.write(f"[SKIP] {message}\n")
+                run.status = "Skipped"
+                run.finished_at = datetime.datetime.now()
+                run.message = message
+                task.status = "Skipped"
+                task.last_run = datetime.datetime.now()
+                db.commit()
+                return
+            upstream_output_path = upstream_run.output_path
+
         env_vars = os.environ.copy()
         env_vars.update({
             "TASK_ID": task_id,
-            "OUTPUT_PATH": str(task_dir / "output"),
-            "UPSTREAM_OUTPUT_PATH": str(DATA_ROOT / task.upstream_id / "output") if task.upstream_id else ""
+            "OUTPUT_PATH": str(run_output_dir),
+            "UPSTREAM_OUTPUT_PATH": upstream_output_path
         })
 
         task.status = "Running"
@@ -116,14 +171,24 @@ def _do_execute_task(task_id: str):
         log_file = task_dir / "logs" / f"{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
-            process = subprocess.Popen(
-                f'conda run -n {task.conda_env} python -u "{script_path}"',
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding='utf-8', env=env_vars
-            )
-            for line in process.stdout: f.write(line)
-            process.wait()
-            task.status = "Success" if process.returncode == 0 else "Failed"
+            try:
+                process = subprocess.Popen(
+                    f'conda run -n {task.conda_env} python -u "{script_path}"',
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding='utf-8', env=env_vars
+                )
+                for line in process.stdout: f.write(line)
+                process.wait()
+                task.status = "Success" if process.returncode == 0 else "Failed"
+                run.status = "Success" if process.returncode == 0 else "Failed"
+                run.finished_at = datetime.datetime.now()
+            except Exception as exc:
+                message = f"Execution error: {exc}"
+                f.write(f"[ERROR] {message}\n")
+                task.status = "Failed"
+                run.status = "Failed"
+                run.finished_at = datetime.datetime.now()
+                run.message = message
     finally:
         db.commit()
         db.close()
