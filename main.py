@@ -205,18 +205,6 @@ def _parse_bool(value: Optional[str]) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _make_output_dir(task_dir: Path, start_time: datetime.datetime) -> Path:
-    """基于时间戳生成输出目录，避免重名。"""
-    base_name = start_time.strftime("%Y%m%d_%H%M%S")
-    output_root = task_dir / "output"
-    candidate = output_root / base_name
-    suffix = 1
-    while candidate.exists():
-        suffix += 1
-        candidate = output_root / f"{base_name}_{suffix}"
-    return candidate
-
-
 def _cleanup_task_logs(task_dir: Path):
     """清理超过保留天数的日志文件。"""
     retention_days = max(int(LOG_RETENTION_DAYS or 0), 0)
@@ -235,19 +223,19 @@ def _cleanup_task_logs(task_dir: Path):
 
 
 def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[Path]):
-    """清理输出文件夹：行情更新只保留最新；因子任务按保留天数清理。"""
+    """清理输出文件夹。
+
+    - 行情更新类任务（task_type == "market"）：不做任何自动清理，由任务脚本自行控制输出文件（通常是同一个增量文件）。
+    - 其他任务：按保留天数清理历史输出目录。
+    """
+    # 行情更新类任务：完全交给任务脚本自己管理 output 下的文件
+    if (task.task_type or "factor") == "market":
+        return
+
     output_root = task_dir / "output"
     if not output_root.exists():
         return
-    if (task.task_type or "factor") == "market":
-        if current_output is None:
-            return
-        for path in output_root.iterdir():
-            if current_output and path.resolve() == current_output.resolve():
-                continue
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-        return
+
     retention_days = max(int(OUTPUT_RETENTION_DAYS or 0), 0)
     if retention_days <= 0:
         return
@@ -261,16 +249,35 @@ def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[P
 
 
 def enqueue_job(task_id: str, trigger_type: str = "cron"):
-    """将任务入队：插入 job_queue 一条 status=Pending、run_date=today 的记录。"""
+    """将任务入队：插入 job_queue 一条 status=Pending、run_date=today 的记录。
+
+    严格限制：同一 task_id 在队列中（Pending/Wait/Runnable）或运行中（Running）只能存在一条记录。
+    若已存在未完成实例，则本次入队直接忽略。
+
+    返回值：
+        True  - 成功入队
+        False - 已有实例在队列或运行中，本次未入队
+    """
     db = SessionLocal()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
-            return
+            return False
+        # 若该任务已有未完成实例在队列或运行中，则不再重复入队
+        existing = (
+            db.query(JobQueue)
+            .filter(
+                JobQueue.task_id == task_id,
+                JobQueue.status.in_(["Pending", "Wait", "Runnable", "Running"]),
+            )
+            .first()
+        )
+        if existing:
+            return False
         now = datetime.datetime.now()
         run_date = datetime.date.today()
         if trigger_type == "cron" and not _is_trading_day(run_date) and not bool(task.run_on_non_trading or 0):
-            return
+            return False
         job_id = str(uuid.uuid4())
         job = JobQueue(
             id=job_id,
@@ -284,37 +291,64 @@ def enqueue_job(task_id: str, trigger_type: str = "cron"):
         db.add(job)
         db.commit()
         _event_queue.put_nowait("update")
+        return True
     finally:
         db.close()
 
 
 def _upstream_success_for_date(db: Session, upstream_id: str, run_date: datetime.date) -> bool:
-    """是否存在 task_id=upstream_id、run_date、status=Success 的 Run。"""
+    """当天该上游最后一次 Run 是否为 Success（按 start_time 降序取第一条）。"""
     r = (
         db.query(Run)
-        .filter(
-            Run.task_id == upstream_id,
-            Run.run_date == run_date,
-            Run.status == "Success",
-        )
+        .filter(Run.task_id == upstream_id, Run.run_date == run_date)
+        .order_by(Run.start_time.desc())
+        .limit(1)
         .first()
     )
-    return r is not None
+    return r is not None and r.status == "Success"
+
+
+def _upstream_job_running(db: Session, upstream_id: str) -> bool:
+    """JobQueue 中是否存在上游任务任意 run_date 的 Running job。"""
+    return (
+        db.query(JobQueue)
+        .filter(JobQueue.task_id == upstream_id, JobQueue.status == "Running")
+        .first()
+        is not None
+    )
+
+
+def _downstream_job_running(db: Session, task_id: str) -> bool:
+    """是否存在以 task_id 为上游的下游任务且其任意 run_date 的 job 正在 Running。"""
+    downstream_ids = [
+        r[0] for r in db.query(Task.id).filter(Task.upstream_id == task_id).all()
+    ]
+    if not downstream_ids:
+        return False
+    return (
+        db.query(JobQueue)
+        .filter(JobQueue.task_id.in_(downstream_ids), JobQueue.status == "Running")
+        .first()
+        is not None
+    )
 
 
 def evaluate_queue_item(db: Session, job: JobQueue) -> str:
     """
-    评估单条队列表项：若依赖满足则返回 'Runnable'，否则返回 'Wait'。
+    评估单条队列表项：若依赖满足且无上游/下游在跑则返回 'Runnable'，否则返回 'Wait'。
     不写库，仅返回目标状态。
     """
     task = db.query(Task).filter(Task.id == job.task_id).first()
     if not task:
         return "Wait"
-    if not task.upstream_id:
-        return "Runnable"
-    if _upstream_success_for_date(db, task.upstream_id, job.run_date):
-        return "Runnable"
-    return "Wait"
+    if task.upstream_id:
+        if _upstream_job_running(db, task.upstream_id):
+            return "Wait"
+        if not _upstream_success_for_date(db, task.upstream_id, job.run_date):
+            return "Wait"
+    if _downstream_job_running(db, job.task_id):
+        return "Wait"
+    return "Runnable"
 
 
 def evaluate_pending_and_wait(db: Session):
@@ -382,36 +416,29 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
         return "Failed"
     task_dir = _get_task_dir(task)
     script_path = task_dir / "script" / task.script_name
-    run_output_dir = Path(run.output_path) if run.output_path else _make_output_dir(task_dir, run.start_time)
-    run_output_dir = run_output_dir if run_output_dir.is_absolute() else task_dir / run_output_dir
-    if not run.output_path:
-        run.output_path = str(run_output_dir)
-    run_output_dir.mkdir(parents=True, exist_ok=True)
+    task_output_dir = task_dir / "output"
     log_path = run.log_path
     log_file = task_dir / log_path if not Path(log_path or "").is_absolute() else Path(log_path)
 
-    upstream_output_path = ""
+    upstream_task_dir = ""
     if task.upstream_id:
-        upstream_run = (
-            db.query(Run)
-            .filter(
-                Run.task_id == task.upstream_id,
-                Run.status == "Success",
-                Run.run_date == run_date,
-            )
-            .order_by(Run.start_time.desc())
-            .first()
-        )
-        if not upstream_run:
+        upstream_task = db.query(Task).filter(Task.id == task.upstream_id).first()
+        if not upstream_task:
             return "Wait"
-        upstream_output_path = upstream_run.output_path or ""
+        if _upstream_job_running(db, task.upstream_id):
+            return "Wait"
+        if not _upstream_success_for_date(db, task.upstream_id, run_date):
+            return "Wait"
+        upstream_task_dir = str(_get_task_dir(upstream_task))
 
     env_vars = os.environ.copy()
     env_vars.update({
         "TASK_ID": task_id,
-        "OUTPUT_PATH": str(run_output_dir),
-        "UPSTREAM_OUTPUT_PATH": upstream_output_path,
+        "OUTPUT_PATH": str(task_output_dir),
+        "OUTPUT_DIR": str(task_output_dir),
     })
+    if task.upstream_id:
+        env_vars["UPSTREAM_TASK_DIR"] = upstream_task_dir
     start_time = run.start_time
     exit_code = None
     status = "Failed"
@@ -453,14 +480,33 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     task.last_run = run_id
     db.commit()
     _cleanup_task_logs(task_dir)
-    _cleanup_task_outputs(task, task_dir, run_output_dir if status == "Success" else None)
+    _cleanup_task_outputs(task, task_dir, None)
     _event_queue.put_nowait("update")
     return status
+
+
+def _can_claim_job(db: Session, job: JobQueue) -> bool:
+    """
+    认领原子时刻三重校验：依赖就绪、无上游在跑、无下游在跑。
+    全部通过返回 True，任一项不满足返回 False。
+    """
+    task = db.query(Task).filter(Task.id == job.task_id).first()
+    if not task:
+        return False
+    if task.upstream_id:
+        if not _upstream_success_for_date(db, task.upstream_id, job.run_date):
+            return False
+        if _upstream_job_running(db, task.upstream_id):
+            return False
+    if _downstream_job_running(db, job.task_id):
+        return False
+    return True
 
 
 def _claim_runnable_job(db: Session):
     """
     认领一条 Runnable 且同一 task_id 无 Running 的队列表项。
+    仅当三重校验（依赖就绪、无上游在跑、无下游在跑）全部通过后才将 job 置为 Running。
     返回 (JobQueue, True) 若认领成功并已置为 Running；返回 (None, False) 若无可认领。
     """
     running_task_ids = {
@@ -472,20 +518,26 @@ def _claim_runnable_job(db: Session):
         .order_by(JobQueue.created_at)
         .all()
     )
-    candidate = next((j for j in candidates if j.task_id not in running_task_ids), None)
-    if not candidate:
-        return None, False
     now = datetime.datetime.now()
-    rows = (
-        db.query(JobQueue)
-        .filter(JobQueue.id == candidate.id, JobQueue.status == "Runnable")
-        .update({"status": "Running", "updated_at": now}, synchronize_session=False)
-    )
+    for candidate in candidates:
+        if candidate.task_id in running_task_ids:
+            continue
+        if not _can_claim_job(db, candidate):
+            candidate.status = "Wait"
+            candidate.updated_at = now
+            continue
+        rows = (
+            db.query(JobQueue)
+            .filter(JobQueue.id == candidate.id, JobQueue.status == "Runnable")
+            .update({"status": "Running", "updated_at": now}, synchronize_session=False)
+        )
+        db.commit()
+        if rows == 0:
+            continue
+        db.refresh(candidate)
+        return candidate, True
     db.commit()
-    if rows == 0:
-        return None, False
-    db.refresh(candidate)
-    return candidate, True
+    return None, False
 
 
 def _consumer_worker():
@@ -510,18 +562,9 @@ def _consumer_worker():
                 db.commit()
                 db.close()
                 continue
-            if not _upstream_success_for_date(db, task.upstream_id, run_date) if task.upstream_id else False:
-                job.status = "Wait"
-                job.updated_at = datetime.datetime.now()
-                db.commit()
-                db.close()
-                _event_queue.put_nowait("update")
-                continue
             start_time = datetime.datetime.now()
             run_id = str(uuid.uuid4())
             task_dir = _get_task_dir(task)
-            run_output_dir = _make_output_dir(task_dir, start_time)
-            run_output_dir.mkdir(parents=True, exist_ok=True)
             log_dir = task_dir / "logs"
             log_dir.mkdir(exist_ok=True)
             log_filename = f"{start_time.strftime('%Y%m%d_%H%M%S')}_{run_id}.log"
@@ -536,7 +579,7 @@ def _consumer_worker():
                 run_date=run_date,
                 log_path=log_path,
                 attempt=last_attempt + 1,
-                output_path=str(run_output_dir),
+                output_path=None,
             )
             db.add(run)
             task.status = "Running"
@@ -880,7 +923,10 @@ def run_now(task_id: str, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    enqueue_job(task_id, "manual")
+    queued = enqueue_job(task_id, "manual")
+    if not queued:
+        # 队列或运行中已存在该任务实例
+        return {"status": "skipped", "reason": "task already queued or running"}
     return {"status": "queued"}
 
 @app.post("/api/stop/{task_id}")

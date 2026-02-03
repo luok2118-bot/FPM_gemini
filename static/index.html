@@ -431,7 +431,7 @@
                         </el-option>
                     </el-select>
                     <div style="font-size: 11px; color: #9ca3af; margin-top: 4px;">
-                        * 选中后，脚本可通过 $UPSTREAM_OUTPUT_PATH 环境变量访问该任务的数据。
+                        * 选中后，脚本可通过 $UPSTREAM_TASK_DIR 环境变量访问上游任务目录；输出目录通过 $OUTPUT_PATH / $OUTPUT_DIR（任务的 output 目录）自由选择是否写入。
                     </div>
                 </el-form-item>
         

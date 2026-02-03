@@ -20,6 +20,7 @@ build/
 # 项目运行时/数据
 tasks_data/
 logs/*.log
+.service.pid
 
 # 静态资源备份
 static/favicon.ico1
