@@ -365,8 +365,11 @@
 
                     <el-table-column prop="last_run" label="上次执行" width="180"></el-table-column>
 
-                    <el-table-column label="操作" width="240" align="right">
+                    <el-table-column label="操作" width="280" align="right">
                         <template #default="scope">
+                            <el-button circle type="primary" plain @click="openTaskDetail(scope.row)" title="配置任务">
+                                <el-icon><setting /></el-icon>
+                            </el-button>
                             <el-button circle type="success" plain :icon="VideoPlay" @click="runNow(scope.row)" :loading="scope.row.status === 'Running'" title="立即运行"></el-button>
                             <el-button circle type="info" plain :icon="Document" @click="viewLogs(scope.row)" title="查看日志"></el-button>
                             <el-button circle type="danger" plain :icon="Delete" @click="deleteTask(scope.row)" title="删除任务"></el-button>
@@ -552,6 +555,99 @@
                 <div class="log-content">{{ logContent }}</div>
             </div>
         </el-dialog>
+
+        <el-dialog 
+            v-model="editDialogVisible" 
+            title="任务详情 / 编辑配置" 
+            width="560px"
+            append-to-body
+            class="custom-dialog"
+            destroy-on-close>
+            <div style="margin-bottom: 16px; padding: 12px 14px; background:#f9fafb; border-radius: 10px; border:1px solid #e5e7eb;">
+                <div style="font-size:14px; font-weight:600; color:#111827; margin-bottom:6px;">
+                    {{ editForm.name || '未命名任务' }}
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:8px; font-size:12px; color:#6b7280;">
+                    <span>脚本: {{ editForm.script || '-' }}</span>
+                    <span>环境: {{ editForm.env || '-' }}</span>
+                    <span>调度: 每天 {{ editForm.time || editForm.schedule || '-' }}</span>
+                </div>
+            </div>
+
+            <el-form :model="editForm" label-position="top" class="modern-form">
+                <el-form-item label="任务识别名称" required>
+                    <el-input v-model="editForm.name" placeholder="任务名称" size="large">
+                        <template #prefix><el-icon><edit-pen /></el-icon></template>
+                    </el-input>
+                </el-form-item>
+
+                <el-form-item label="数据依赖 (Pipeline)">
+                    <el-select v-model="editForm.upstream_id" placeholder="选择此任务需要读取哪个任务的输出？" style="width: 100%" clearable size="large">
+                        <template #prefix><el-icon><connection /></el-icon></template>
+                        <el-option v-for="t in tasks" :key="t.id" :label="t.name" :value="t.id">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span>{{ t.name }}</span>
+                                <el-tag size="small" type="info" effect="plain">{{ t.env }}</el-tag>
+                            </div>
+                        </el-option>
+                    </el-select>
+                    <div style="font-size: 11px; color: #9ca3af; margin-top: 4px;">
+                        * 选中后，脚本可通过 $UPSTREAM_TASK_DIR 访问上游任务目录。
+                    </div>
+                </el-form-item>
+
+                <el-row :gutter="20">
+                    <el-col :span="12">
+                        <el-form-item label="运行环境">
+                            <el-select v-model="editForm.env" placeholder="选择 Conda 环境" style="width: 100%" size="large">
+                                <el-option v-for="item in envs" :key="item" :label="item" :value="item"></el-option>
+                            </el-select>
+                        </el-form-item>
+                    </el-col>
+                    <el-col :span="12">
+                        <el-form-item label="每日触发时间">
+                            <el-time-select 
+                                v-model="editForm.time" 
+                                start="00:00" 
+                                step="00:15" 
+                                end="23:45" 
+                                placeholder="选择时间"
+                                style="width: 100%"
+                                size="large">
+                            </el-time-select>
+                        </el-form-item>
+                    </el-col>
+                </el-row>
+                <el-row :gutter="20">
+                    <el-col :span="12">
+                        <el-form-item label="任务类型">
+                            <el-select v-model="editForm.task_type" placeholder="选择任务类型" style="width: 100%" size="large">
+                                <el-option label="行情更新任务" value="market"></el-option>
+                                <el-option label="因子计算任务" value="factor"></el-option>
+                            </el-select>
+                        </el-form-item>
+                    </el-col>
+                    <el-col :span="12">
+                        <el-form-item label="非交易日执行">
+                            <el-switch
+                                v-model="editForm.run_on_non_trading"
+                                active-text="执行"
+                                inactive-text="不执行"
+                                size="large" />
+                        </el-form-item>
+                    </el-col>
+                </el-row>
+            </el-form>
+
+            <template #footer>
+                <div class="dialog-footer">
+                    <el-button @click="editDialogVisible = false" size="large">取消</el-button>
+                    <el-button type="primary" @click="saveTaskConfig" size="large" class="glow-button">
+                        保存配置
+                    </el-button>
+                </div>
+            </template>
+        </el-dialog>
     </div>
 
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
@@ -588,6 +684,20 @@
                         name: '',
                         env: '',
                         time: '',
+                        upstream_id: '',
+                        task_type: 'factor',
+                        run_on_non_trading: false,
+                    });
+
+                    const editDialogVisible = ref(false);
+                    const editingTaskId = ref(null);
+                    const editForm = reactive({
+                        id: '',
+                        name: '',
+                        script: '',
+                        env: '',
+                        time: '',
+                        schedule: '',
                         upstream_id: '',
                         task_type: 'factor',
                         run_on_non_trading: false,
@@ -821,6 +931,54 @@
                         }
                     };
 
+                    const openTaskDetail = async (row) => {
+                        try {
+                            const res = await axios.get(`/api/tasks/${row.id}`);
+                            const task = res.data;
+                            editingTaskId.value = task.id;
+                            editForm.id = task.id;
+                            editForm.name = task.name || '';
+                            editForm.script = task.script || '';
+                            editForm.env = task.env || '';
+                            editForm.time = task.time || task.schedule || '';
+                            editForm.schedule = task.schedule || task.time || '';
+                            editForm.upstream_id = task.upstream_id || '';
+                            editForm.task_type = task.task_type || 'factor';
+                            editForm.run_on_non_trading = !!task.run_on_non_trading;
+                            editDialogVisible.value = true;
+                        } catch (e) {
+                            ElementPlus.ElMessage.error(e?.response?.data?.detail || '获取任务详情失败');
+                        }
+                    };
+
+                    const saveTaskConfig = async () => {
+                        if (!editingTaskId.value) {
+                            ElementPlus.ElMessage.error('未选择任务');
+                            return;
+                        }
+                        if (!editForm.name || !editForm.env || !editForm.time || !editForm.task_type) {
+                            ElementPlus.ElMessage.warning('请完善任务名称、运行环境、触发时间和任务类型');
+                            return;
+                        }
+                        const fd = new FormData();
+                        fd.append('name', editForm.name);
+                        fd.append('conda_env', editForm.env);
+                        fd.append('time', editForm.time);
+                        fd.append('task_type', editForm.task_type);
+                        fd.append('run_on_non_trading', editForm.run_on_non_trading ? 'true' : 'false');
+                        if (editForm.upstream_id) {
+                            fd.append('upstream_id', editForm.upstream_id);
+                        }
+                        try {
+                            await axios.put(`/api/tasks/${editingTaskId.value}`, fd);
+                            ElementPlus.ElMessage.success('配置已保存');
+                            editDialogVisible.value = false;
+                            fetchTasks(false);
+                        } catch (e) {
+                            ElementPlus.ElMessage.error(e?.response?.data?.detail || '保存失败');
+                        }
+                    };
+
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
@@ -886,6 +1044,7 @@
                         currentTaskName, currentEnv, logContent, currentRunId, nowTick,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, fetchTasks,
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
+                        editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
                         Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
                         deleteTask
                     };

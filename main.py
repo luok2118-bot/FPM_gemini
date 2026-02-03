@@ -415,6 +415,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     if not run or not task:
         return "Failed"
     task_dir = _get_task_dir(task)
+    script_dir = task_dir / "script"
     script_path = task_dir / "script" / task.script_name
     task_output_dir = task_dir / "output"
     log_path = run.log_path
@@ -433,6 +434,8 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
 
     env_vars = os.environ.copy()
     env_vars.update({
+        "SCRIPT_DIR" : str(script_dir),
+        "SCRIPT_PATH": str(script_path),
         "TASK_ID": task_id,
         "OUTPUT_PATH": str(task_output_dir),
         "OUTPUT_DIR": str(task_output_dir),
@@ -751,6 +754,38 @@ def list_tasks(db: Session = Depends(get_db)):
         })
     return res
 
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    job = scheduler.get_job(task.id)
+    latest_run = (
+        db.query(Run)
+        .filter(Run.task_id == task.id)
+        .order_by(Run.start_time.desc())
+        .first()
+    )
+    last_run_time = latest_run.start_time.strftime("%Y-%m-%d %H:%M:%S") if latest_run and latest_run.start_time else "-"
+    last_run_ts = latest_run.start_time.isoformat() if latest_run and latest_run.start_time else None
+    last_status = latest_run.status if latest_run else "Idle"
+    return {
+        "id": task.id,
+        "name": task.name,
+        "script": task.script_name,
+        "env": task.conda_env,
+        "time": task.cron_time,
+        "schedule": task.cron_time,
+        "status": last_status,
+        "last_run": last_run_time,
+        "last_run_ts": last_run_ts,
+        "next_run": job.next_run_time.strftime("%H:%M:%S") if job and job.next_run_time else "Paused",
+        "task_type": task.task_type or "factor",
+        "run_on_non_trading": bool(task.run_on_non_trading or 0),
+        "upstream_id": task.upstream_id,
+    }
+
 def _format_run(run: TaskRun):
     return {
         "run_id": run.run_id,
@@ -834,6 +869,46 @@ async def create_task(
     scheduler.add_job(enqueue_job, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
     _event_queue.put_nowait("changed")
     return {"id": task_id}
+
+
+@app.put("/api/tasks/{task_id}")
+async def update_task(
+    task_id: str,
+    name: str = Form(...),
+    conda_env: str = Form(...),
+    time: str = Form(...),
+    upstream_id: Optional[str] = Form(None),
+    task_type: str = Form("factor"),
+    run_on_non_trading: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task.name = name
+    task.conda_env = conda_env
+    task.cron_time = time
+    task.upstream_id = upstream_id
+    task.task_type = task_type or "factor"
+    task.run_on_non_trading = 1 if _parse_bool(run_on_non_trading) else 0
+
+    db.commit()
+
+    # 同步更新调度配置
+    try:
+        h, m = time.split(":")
+        job = scheduler.get_job(task_id)
+        if job:
+            scheduler.reschedule_job(task_id, trigger='cron', hour=int(h), minute=int(m))
+        else:
+            scheduler.add_job(enqueue_job, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
+    except Exception as exc:
+        # 仅记录错误，不阻塞任务基础信息更新
+        raise HTTPException(status_code=500, detail=f"Update schedule failed: {exc}")
+
+    _event_queue.put_nowait("changed")
+    return {"status": "success"}
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str, bg: BackgroundTasks, db: Session = Depends(get_db)):
