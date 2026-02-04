@@ -248,6 +248,88 @@ def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[P
             pass
 
 
+def _resolve_run_log_file(task_dir: Path, log_path: Optional[str]) -> Path:
+    if not log_path:
+        return task_dir / "logs" / "unknown.log"
+    log_file = Path(log_path)
+    if not log_file.is_absolute():
+        log_file = task_dir / log_file
+    return log_file
+
+
+def _stop_process_windows(process: subprocess.Popen) -> tuple[bool, str, Optional[int]]:
+    if process.poll() is not None:
+        return True, "process already exited", process.returncode
+    try:
+        if os.name == "nt":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=2)
+            return True, "stopped", process.returncode
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+            return True, "force killed", process.returncode
+    except Exception as exc:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+            return True, f"kill due to error: {exc}", process.returncode
+        except Exception as kill_exc:
+            return False, f"failed to stop process: {kill_exc}", process.returncode
+
+
+def _mark_stopped(
+    db: Session,
+    task_id: str,
+    run_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    message: Optional[str] = None,
+    exit_code: Optional[int] = None,
+    update_running_jobs: bool = False,
+):
+    now = datetime.datetime.now()
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task:
+        task.status = "Stopped"
+        if run_id:
+            task.last_run = run_id
+    run = None
+    if run_id:
+        run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+    if not run:
+        run = (
+            db.query(Run)
+            .filter(Run.task_id == task_id)
+            .order_by(Run.start_time.desc())
+            .first()
+        )
+    if run:
+        run.status = "Stopped"
+        run.end_time = run.end_time or now
+        if run.start_time and run.end_time:
+            run.duration_ms = int((run.end_time - run.start_time).total_seconds() * 1000)
+        if exit_code is not None:
+            run.exit_code = exit_code
+        if message:
+            run.message = message
+    if job_id:
+        job = db.query(JobQueue).filter(JobQueue.id == job_id).first()
+        if job:
+            job.status = "Stopped"
+            job.updated_at = now
+            if message:
+                job.message = message
+    if update_running_jobs:
+        (
+            db.query(JobQueue)
+            .filter(JobQueue.task_id == task_id, JobQueue.status == "Running")
+            .update({"status": "Stopped", "updated_at": now}, synchronize_session=False)
+        )
+    db.commit()
+
 def enqueue_job(task_id: str, trigger_type: str = "cron"):
     """将任务入队：插入 job_queue 一条 status=Pending、run_date=today 的记录。
 
@@ -418,8 +500,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     script_dir = task_dir / "script"
     script_path = task_dir / "script" / task.script_name
     task_output_dir = task_dir / "output"
-    log_path = run.log_path
-    log_file = task_dir / log_path if not Path(log_path or "").is_absolute() else Path(log_path)
+    log_file = _resolve_run_log_file(task_dir, run.log_path)
 
     upstream_task_dir = ""
     upstream_script_dir = ""
@@ -440,6 +521,8 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
         "TASK_ID": task_id,
         "OUTPUT_PATH": str(task_output_dir),
         "OUTPUT_DIR": str(task_output_dir),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
     })
     if task.upstream_id:
         env_vars["UPSTREAM_TASK_DIR"] = upstream_task_dir
@@ -448,18 +531,25 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     exit_code = None
     status = "Failed"
     try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+            f.flush()
+            is_windows = os.name == "nt"
+            creationflags = 0
+            if is_windows and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             process = subprocess.Popen(
-                f'conda run -n {task.conda_env} python -u "{script_path}"',
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", env=env_vars,
-                start_new_session=True,
+                f'conda run --no-capture-output -n {task.conda_env} python -u "{script_path}"',
+                shell=True,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                env=env_vars,
+                creationflags=creationflags,
+                start_new_session=not is_windows,
             )
             with _task_process_lock:
                 _task_processes[task_id] = process
-            for line in process.stdout:
-                f.write(line)
             process.wait()
             with _task_process_lock:
                 was_stopped = task_id in _task_stop_requests
@@ -980,16 +1070,26 @@ def cancel_queue_job(job_id: str, db: Session = Depends(get_db)):
             else:
                 process = None
         if process:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except Exception:
-                process.kill()
-        job.status = "Stopped"
-        job.updated_at = datetime.datetime.now()
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task:
-            task.status = "Stopped"
-        db.commit()
+            stopped, message, exit_code = _stop_process_windows(process)
+            _mark_stopped(
+                db,
+                task_id=task_id,
+                run_id=job.run_id,
+                job_id=job.id,
+                message=message,
+                exit_code=exit_code,
+            )
+            if not stopped:
+                raise HTTPException(status_code=500, detail=message)
+        else:
+            _mark_stopped(
+                db,
+                task_id=task_id,
+                run_id=job.run_id,
+                job_id=job.id,
+                message="process not found",
+                exit_code=None,
+            )
         _event_queue.put_nowait("update")
         return {"status": "stopped"}
     raise HTTPException(status_code=400, detail="Job already finished")
@@ -1019,12 +1119,18 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
             process = None
     if not process:
         raise HTTPException(status_code=409, detail="Task is not running")
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except Exception:
-        process.kill()
-    task.status = "Stopped"
-    db.commit()
+    stopped, message, exit_code = _stop_process_windows(process)
+    _mark_stopped(
+        db,
+        task_id=task_id,
+        run_id=task.last_run,
+        job_id=None,
+        message=message,
+        exit_code=exit_code,
+        update_running_jobs=True,
+    )
+    if not stopped:
+        raise HTTPException(status_code=500, detail=message)
     _event_queue.put_nowait("changed")
     return {"status": "stopped"}
 
@@ -1041,18 +1147,14 @@ def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(ge
         run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
         if not run:
             return {"content": "未找到对应运行记录。", "run_id": None}
-        log_file = Path(run.log_path or "")
-        if not log_file.is_absolute():
-            log_file = task_dir / log_file
+        log_file = _resolve_run_log_file(task_dir, run.log_path)
         if log_file.exists():
             return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
         return {"content": "日志文件不存在。", "run_id": run.id}
 
     run = db.query(Run).filter(Run.task_id == task_id).order_by(Run.start_time.desc()).first()
     if run:
-        log_file = Path(run.log_path or "")
-        if not log_file.is_absolute():
-            log_file = task_dir / log_file
+        log_file = _resolve_run_log_file(task_dir, run.log_path)
         if log_file.exists():
             return {"content": log_file.read_text(encoding="utf-8", errors="replace"), "run_id": run.id}
         return {"content": "日志文件不存在。", "run_id": run.id}
@@ -1062,6 +1164,56 @@ def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(ge
         return {"content": "暂无日志数据。", "run_id": None}
     latest = max(log_files, key=lambda p: p.stat().st_mtime)
     return {"content": latest.read_text(encoding="utf-8", errors="replace"), "run_id": None}
+
+
+@app.get("/api/logs_tail/{task_id}")
+def get_log_tail(
+    task_id: str,
+    run_id: Optional[str] = None,
+    offset: int = 0,
+    max_bytes: int = 65536,
+    db: Session = Depends(get_db),
+):
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    if max_bytes <= 0:
+        raise HTTPException(status_code=400, detail="max_bytes must be > 0")
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task_dir = _get_task_dir(task)
+    run = None
+    if run_id:
+        run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+        if not run:
+            return {"data": "", "offset": offset, "eof": True, "run_id": None, "message": "run not found"}
+    if not run:
+        run = (
+            db.query(Run)
+            .filter(Run.task_id == task_id)
+            .order_by(Run.start_time.desc())
+            .first()
+        )
+    if not run:
+        return {"data": "", "offset": offset, "eof": True, "run_id": None, "message": "run not found"}
+    log_file = _resolve_run_log_file(task_dir, run.log_path)
+    if not log_file.exists():
+        return {"data": "", "offset": offset, "eof": True, "run_id": run.id, "message": "log file not found"}
+    file_size = log_file.stat().st_size
+    if offset >= file_size:
+        return {"data": "", "offset": offset, "eof": True, "run_id": run.id}
+    read_size = min(max_bytes, file_size - offset)
+    with open(log_file, "rb") as f:
+        f.seek(offset)
+        data = f.read(read_size)
+    new_offset = offset + len(data)
+    eof = new_offset >= file_size
+    return {
+        "data": data.decode("utf-8", errors="replace"),
+        "offset": new_offset,
+        "eof": eof,
+        "run_id": run.id,
+    }
 
 @app.get("/api/runs/{task_id}")
 def list_runs(task_id: str, db: Session = Depends(get_db)):
