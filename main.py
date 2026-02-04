@@ -422,6 +422,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     log_file = task_dir / log_path if not Path(log_path or "").is_absolute() else Path(log_path)
 
     upstream_task_dir = ""
+    upstream_script_dir = ""
     if task.upstream_id:
         upstream_task = db.query(Task).filter(Task.id == task.upstream_id).first()
         if not upstream_task:
@@ -431,7 +432,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
         if not _upstream_success_for_date(db, task.upstream_id, run_date):
             return "Wait"
         upstream_task_dir = str(_get_task_dir(upstream_task))
-
+        upstream_script_dir = str(upstream_task_dir / "script")
     env_vars = os.environ.copy()
     env_vars.update({
         "SCRIPT_DIR" : str(script_dir),
@@ -442,6 +443,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     })
     if task.upstream_id:
         env_vars["UPSTREAM_TASK_DIR"] = upstream_task_dir
+        env_vars["UPSTREAM_SCRIPT_DIR"] = upstream_script_dir
     start_time = run.start_time
     exit_code = None
     status = "Failed"
