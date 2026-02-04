@@ -450,6 +450,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     try:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+            f.flush()
             process = subprocess.Popen(
                 f'conda run -n {task.conda_env} python -u "{script_path}"',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -460,6 +461,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
                 _task_processes[task_id] = process
             for line in process.stdout:
                 f.write(line)
+                f.flush()
             process.wait()
             with _task_process_lock:
                 was_stopped = task_id in _task_stop_requests

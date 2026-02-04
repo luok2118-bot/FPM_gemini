@@ -552,7 +552,7 @@
                     </div>
                     <span>Env: {{ currentEnv }}</span>
                 </div>
-                <div class="log-content">{{ logContent }}</div>
+                <div class="log-content" ref="logBox">{{ logContent }}</div>
             </div>
         </el-dialog>
 
@@ -657,7 +657,7 @@
 
     <script>
         const initApp = () => {
-            const { createApp, ref, reactive, onMounted, onUnmounted } = Vue;
+            const { createApp, ref, reactive, onMounted, onUnmounted, watch, nextTick } = Vue;
             const { Plus, VideoPlay, Document, Refresh, Delete, CircleClose } = ElementPlusIconsVue;
 
             const app = createApp({
@@ -679,6 +679,8 @@
                     const logContent = ref("");
                     const currentRunId = ref("");
                     const nowTick = ref(Date.now());
+                    const logBox = ref(null);
+                    const logPollTimer = ref(null);
 
                     const form = reactive({
                         name: '',
@@ -826,18 +828,24 @@
                         currentTaskName.value = row.name;
                         currentEnv.value = row.env;
                         logVisible.value = true;
-                        await fetchRuns();
-                        fetchLog();
+                        await fetchRuns(true);
                     };
 
-                    const fetchRuns = async () => {
+                    const fetchRuns = async (refreshLog = true) => {
                         if (!currentTaskId.value) return;
                         runsLoading.value = true;
                         try {
                             const res = await axios.get(`/api/tasks/${currentTaskId.value}/runs`, { params: { limit: 20 } });
                             runs.value = res.data;
-                            currentRunId.value = runs.value.length ? (runs.value[0].id || runs.value[0].run_id) : "";
-                            if (runs.value.length) fetchLog();
+                            if (runs.value.length) {
+                                const existing = runs.value.find((run) => (run.id || run.run_id) === currentRunId.value);
+                                if (!existing) {
+                                    currentRunId.value = runs.value[0].id || runs.value[0].run_id;
+                                }
+                                if (refreshLog) fetchLog(true);
+                            } else {
+                                currentRunId.value = "";
+                            }
                         } catch (e) {
                             runs.value = [];
                             currentRunId.value = "";
@@ -848,18 +856,66 @@
 
                     const fetchLogForRun = (run) => {
                         currentRunId.value = run.id || run.run_id;
-                        fetchLog();
+                        fetchLog(true);
                     };
 
-                    const fetchLog = async () => {
+                    const shouldStickToBottom = () => {
+                        const el = logBox.value;
+                        if (!el) return true;
+                        return el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+                    };
+
+                    const getCurrentRun = () => {
+                        return runs.value.find((run) => (run.id || run.run_id) === currentRunId.value);
+                    };
+
+                    const isCurrentRunRunning = () => {
+                        const run = getCurrentRun();
+                        return run && run.status === "Running";
+                    };
+
+                    const fetchLog = async (showLoading = true) => {
                         if(!currentTaskId.value) return;
-                        logContent.value = "Loading...";
+                        if (showLoading) logContent.value = "Loading...";
+                        const stickToBottom = shouldStickToBottom();
                         try {
                             const config = currentRunId.value ? { params: { run_id: currentRunId.value } } : {};
                             const res = await axios.get(`/api/logs/${currentTaskId.value}`, config);
                             logContent.value = res.data.content;
+                            if (stickToBottom) {
+                                await nextTick();
+                                if (logBox.value) {
+                                    logBox.value.scrollTop = logBox.value.scrollHeight;
+                                }
+                            }
                         } catch(e) { logContent.value = "暂无日志数据"; }
                     };
+
+                    const startLogPolling = () => {
+                        if (logPollTimer.value) clearInterval(logPollTimer.value);
+                        logPollTimer.value = setInterval(async () => {
+                            if (!logVisible.value || !currentTaskId.value) return;
+                            if (isCurrentRunRunning()) {
+                                await fetchRuns(false);
+                            }
+                            await fetchLog(false);
+                        }, 1500);
+                    };
+
+                    const stopLogPolling = () => {
+                        if (logPollTimer.value) {
+                            clearInterval(logPollTimer.value);
+                            logPollTimer.value = null;
+                        }
+                    };
+
+                    watch(() => logVisible.value, (val) => {
+                        if (val) {
+                            startLogPolling();
+                        } else {
+                            stopLogPolling();
+                        }
+                    });
 
                     const getElapsedSeconds = (row) => {
                         if (!row.last_run_ts) return 0;
@@ -1035,13 +1091,14 @@
                             if (sseEv) sseEv.close();
                             if (pendingRefresh) clearTimeout(pendingRefresh);
                             clearInterval(timer);
+                            stopLogPolling();
                         });
                     });
 
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
                         runs, runsLoading, queueItems, queueLoading, fetchQueue,
-                        currentTaskName, currentEnv, logContent, currentRunId, nowTick,
+                        currentTaskName, currentEnv, logContent, currentRunId, nowTick, logBox,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, fetchTasks,
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
