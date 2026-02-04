@@ -20,13 +20,13 @@
 
         /* 表单间距优化 */
         .modern-form .el-form-item {
-            margin-bottom: 22px;
+            margin-bottom: 14px;
         }
 
         .modern-form .el-form-item__label {
             font-weight: 600;
             color: #374151;
-            padding-bottom: 8px !important;
+            padding-bottom: 5px !important;
         }
 
         /* 上传区域美化 */
@@ -41,15 +41,15 @@
         .modern-upload .el-upload-dragger {
             border: 2px dashed #e5e7eb;
             background: #f9fafb;
-            padding: 20px !important;
+            padding: 12px !important;
             transition: all 0.3s ease;
             width: 100%;
-            min-height: 150px;
+            min-height: 95px;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            gap: 6px;
+            gap: 4px;
         }
 
         .modern-upload .el-upload-dragger:hover {
@@ -84,14 +84,14 @@
         .upload-selected {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 8px;
             width: 100%;
         }
 
         .upload-selected__icon {
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
             background: #dbeafe;
             display: inline-flex;
             align-items: center;
@@ -107,11 +107,11 @@
             font-weight: 600;
             color: #1d4ed8;
             margin-bottom: 4px;
-            font-size: 14px;
+            font-size: 13px;
         }
 
         .upload-selected__name {
-            font-size: 13px;
+            font-size: 12px;
             color: #1f2937;
             white-space: nowrap;
             overflow: hidden;
@@ -119,7 +119,7 @@
         }
 
         .upload-selected__hint {
-            font-size: 12px;
+            font-size: 11px;
             color: #6b7280;
         }
 
@@ -534,20 +534,20 @@
         <el-dialog 
             v-model="dialogVisible" 
             title="配置任务" 
-            width="540px" 
+            width="460px" 
             append-to-body
             class="custom-dialog"
             destroy-on-close>
             
             <el-form :model="form" label-position="top" class="modern-form">
                 <el-form-item label="任务识别名称" required>
-                    <el-input v-model="form.name" placeholder="建议格式: 策略名_频率_版本 (e.g., Alpha101_Daily_V1)" size="large">
+                    <el-input v-model="form.name" placeholder="建议格式: 策略名_频率_版本 (e.g., Alpha101_Daily_V1)" size="default">
                         <template #prefix><el-icon><edit-pen /></el-icon></template>
                     </el-input>
                 </el-form-item>
         
                 <el-form-item label="数据依赖 (Pipeline)">
-                    <el-select v-model="form.upstream_id" placeholder="选择此任务需要读取哪个任务的输出？" style="width: 100%" clearable size="large">
+                    <el-select v-model="form.upstream_id" placeholder="选择此任务需要读取哪个任务的输出？" style="width: 100%" clearable size="default">
                         <template #prefix><el-icon><connection /></el-icon></template>
                         <el-option v-for="t in tasks" :key="t.id" :label="t.name" :value="t.id">
                             <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -556,7 +556,7 @@
                             </div>
                         </el-option>
                     </el-select>
-                    <div style="font-size: 11px; color: #9ca3af; margin-top: 4px;">
+                    <div style="font-size: 11px; color: #9ca3af; margin-top: 3px; line-height: 1.4;">
                         * 选中后，脚本可通过 $UPSTREAM_TASK_DIR 环境变量访问上游任务目录；输出目录通过 $OUTPUT_PATH / $OUTPUT_DIR（任务的 output 目录）自由选择是否写入。
                     </div>
                 </el-form-item>
@@ -589,10 +589,10 @@
                     </el-upload>
                 </el-form-item>
         
-                <el-row :gutter="20">
+                <el-row :gutter="16">
                     <el-col :span="12">
                         <el-form-item label="运行环境">
-                            <el-select v-model="form.env" placeholder="选择 Conda 环境" style="width: 100%" size="large">
+                            <el-select v-model="form.env" placeholder="选择 Conda 环境" style="width: 100%" size="default">
                                 <el-option v-for="item in envs" :key="item" :label="item" :value="item"></el-option>
                             </el-select>
                         </el-form-item>
@@ -606,15 +606,15 @@
                                 end="23:45" 
                                 placeholder="选择时间"
                                 style="width: 100%"
-                                size="large">
+                                size="default">
                             </el-time-select>
                         </el-form-item>
                     </el-col>
                 </el-row>
-                <el-row :gutter="20">
+                <el-row :gutter="16">
                     <el-col :span="12">
                         <el-form-item label="任务类型">
-                            <el-select v-model="form.task_type" placeholder="选择任务类型" style="width: 100%" size="large">
+                            <el-select v-model="form.task_type" placeholder="选择任务类型" style="width: 100%" size="default">
                                 <el-option label="行情更新任务" value="market"></el-option>
                                 <el-option label="因子计算任务" value="factor"></el-option>
                             </el-select>
@@ -626,7 +626,7 @@
                                 v-model="form.run_on_non_trading"
                                 active-text="执行"
                                 inactive-text="不执行"
-                                size="large" />
+                                size="default" />
                         </el-form-item>
                     </el-col>
                 </el-row>
@@ -634,8 +634,8 @@
         
             <template #footer>
                 <div class="dialog-footer">
-                    <el-button @click="dialogVisible = false" size="large">取消</el-button>
-                    <el-button type="primary" @click="createTask" size="large" class="glow-button">
+                    <el-button @click="dialogVisible = false" size="default">取消</el-button>
+                    <el-button type="primary" @click="createTask" size="default" class="glow-button">
                         部署任务
                     </el-button>
                 </div>
