@@ -225,8 +225,20 @@
             display: flex;
             justify-content: space-between;
         }
+        .log-dialog {
+            width: 900px;
+            max-width: 90vw;
+        }
+        .log-content-wrap {
+            flex: 1;
+            min-height: 320px;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
         .log-content {
             flex: 1;
+            min-height: 320px;
             padding: 15px;
             overflow-y: auto;
             color: #c9d1d9;
@@ -234,9 +246,38 @@
             font-size: 13px;
             white-space: pre-wrap;
         }
-
+        .log-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 320px;
+            color: #8b949e;
+            font-size: 13px;
+        }
+        .log-error-msg {
+            font-size: 12px;
+            color: #f85149;
+        }
+        .log-status-badge {
+            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .log-status-live {
+            background: rgba(35, 134, 54, 0.2);
+            color: #3fb950;
+        }
+        .log-status-ended {
+            background: rgba(110, 118, 129, 0.2);
+            color: #8b949e;
+        }
         .runs-panel {
             margin-bottom: 12px;
+        }
+        .runs-panel-toolbar {
+            margin-bottom: 8px;
         }
 
         .runs-panel .el-table {
@@ -511,8 +552,11 @@
             </template>
         </el-dialog>
 
-        <el-dialog v-model="logVisible" :title="currentTaskName" width="900px" @close="stopLogTail">
+        <el-dialog v-model="logVisible" :title="currentTaskName" class="log-dialog" @close="stopLogTail">
             <div class="runs-panel">
+                <div class="runs-panel-toolbar">
+                    <el-button size="small" @click="refreshRunsAndMaybeSwitch()">刷新运行列表</el-button>
+                </div>
                 <el-table :data="runs" height="200" size="small" v-loading="runsLoading">
                     <el-table-column prop="start_time" label="开始时间" width="170"></el-table-column>
                     <el-table-column prop="status" label="状态" width="110"></el-table-column>
@@ -549,10 +593,24 @@
                                 :value="run.id">
                             </el-option>
                         </el-select>
+                        <span v-if="currentRunStatus === 'Running'" class="log-status-badge log-status-live">实时</span>
+                        <span v-else-if="currentRunStatus" class="log-status-badge log-status-ended">已结束</span>
                     </div>
                     <span>Env: {{ currentEnv }}</span>
                 </div>
-                <div class="log-content">{{ logContent }}</div>
+                <div class="log-content-wrap" v-loading="logLoading">
+                    <template v-if="logError">
+                        <div class="log-placeholder">
+                            <span>加载失败</span>
+                            <span v-if="logErrorMessage" class="log-error-msg">{{ logErrorMessage }}</span>
+                            <el-button type="primary" size="small" @click="logError = false; fetchLog()">重试</el-button>
+                        </div>
+                    </template>
+                    <template v-else-if="!logContent && !logLoading">
+                        <div class="log-placeholder">暂无日志</div>
+                    </template>
+                    <div v-else ref="logContentEl" class="log-content">{{ logContent }}</div>
+                </div>
             </div>
         </el-dialog>
 
@@ -657,7 +715,7 @@
 
     <script>
         const initApp = () => {
-            const { createApp, ref, reactive, onMounted, onUnmounted } = Vue;
+            const { createApp, ref, reactive, computed, nextTick, onMounted, onUnmounted } = Vue;
             const { Plus, VideoPlay, Document, Refresh, Delete, CircleClose } = ElementPlusIconsVue;
 
             const app = createApp({
@@ -677,10 +735,20 @@
                     const currentTaskName = ref("");
                     const currentEnv = ref("");
                     const logContent = ref("");
+                    const logLoading = ref(false);
+                    const logError = ref(false);
+                    const logErrorMessage = ref("");
+                    const logContentEl = ref(null);
                     const currentRunId = ref("");
                     const logTailOffset = ref(0);
                     const logTailTimer = ref(null);
                     const nowTick = ref(Date.now());
+
+                    const currentRunStatus = computed(() => {
+                        if (!currentRunId.value || !runs.value.length) return null;
+                        const r = runs.value.find(x => (x.id || x.run_id) === currentRunId.value);
+                        return r ? r.status : null;
+                    });
 
                     const form = reactive({
                         name: '',
@@ -836,15 +904,31 @@
                         if (!currentTaskId.value) return;
                         runsLoading.value = true;
                         try {
+                            const prevRunId = currentRunId.value;
                             const res = await axios.get(`/api/tasks/${currentTaskId.value}/runs`, { params: { limit: 20 } });
-                            runs.value = res.data;
-                            currentRunId.value = runs.value.length ? (runs.value[0].id || runs.value[0].run_id) : "";
-                            if (runs.value.length) fetchLog();
+                            runs.value = res.data || [];
+                            // 默认行为：如果当前选中的 run 仍然存在，则保持不变；否则退回到最新一条
+                            if (prevRunId && runs.value.some(r => (r.id || r.run_id) === prevRunId)) {
+                                currentRunId.value = prevRunId;
+                            } else {
+                                currentRunId.value = runs.value.length ? (runs.value[0].id || runs.value[0].run_id) : "";
+                            }
                         } catch (e) {
                             runs.value = [];
                             currentRunId.value = "";
                         } finally {
                             runsLoading.value = false;
+                        }
+                    };
+
+                    const refreshRunsAndMaybeSwitch = async () => {
+                        const oldFirstId = runs.value.length ? (runs.value[0].id || runs.value[0].run_id) : null;
+                        await fetchRuns();
+                        const newFirstId = runs.value.length ? (runs.value[0].id || runs.value[0].run_id) : null;
+                        // 若出现新的 run（最新一条发生变化），切换到最新 run 并重拉日志
+                        if (newFirstId && newFirstId !== oldFirstId) {
+                            currentRunId.value = newFirstId;
+                            fetchLog();
                         }
                     };
 
@@ -857,14 +941,23 @@
                         if(!currentTaskId.value) return;
                         logContent.value = "";
                         logTailOffset.value = 0;
+                        logError.value = false;
+                        logErrorMessage.value = "";
                         stopLogTail();
-                        await fetchLogTailOnce();
-                        startLogTail();
+                        logLoading.value = true;
+                        try {
+                            await fetchLogTailOnce();
+                            startLogTail();
+                        } finally {
+                            logLoading.value = false;
+                        }
                     };
 
                     const fetchLogTailOnce = async () => {
                         if (!currentTaskId.value) return;
                         try {
+                            logError.value = false;
+                            logErrorMessage.value = "";
                             const config = {
                                 params: {
                                     run_id: currentRunId.value || undefined,
@@ -876,6 +969,12 @@
                             const payload = res.data || {};
                             if (payload.data) {
                                 logContent.value += payload.data;
+                                const runStatus = runs.value.find(r => (r.id || r.run_id) === currentRunId.value)?.status;
+                                if (runStatus === 'Running') {
+                                    nextTick(() => {
+                                        if (logContentEl.value) logContentEl.value.scrollTop = logContentEl.value.scrollHeight;
+                                    });
+                                }
                             }
                             if (typeof payload.offset === 'number') {
                                 logTailOffset.value = payload.offset;
@@ -884,7 +983,9 @@
                                 currentRunId.value = payload.run_id;
                             }
                         } catch (e) {
-                            logContent.value = logContent.value || "暂无日志数据";
+                            logError.value = true;
+                            logErrorMessage.value = e?.response?.data?.detail || e?.message || "加载失败";
+                            if (!logContent.value) logContent.value = "";
                         }
                     };
 
@@ -1083,8 +1184,9 @@
                     return {
                         tasks, envs, loading, dialogVisible, logVisible, form, selectedFile,
                         runs, runsLoading, queueItems, queueLoading, fetchQueue,
-                        currentTaskName, currentEnv, logContent, currentRunId, nowTick,
-                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, fetchTasks,
+                        currentTaskName, currentEnv, logContent, logLoading, logError, logErrorMessage,
+                        logContentEl, currentRunStatus, currentRunId, nowTick,
+                        handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, refreshRunsAndMaybeSwitch, fetchTasks,
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
                         Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
