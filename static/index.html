@@ -680,7 +680,7 @@
                     const currentRunId = ref("");
                     const nowTick = ref(Date.now());
                     const logBox = ref(null);
-                    const logPollTimer = ref(null);
+                    const logStream = ref(null);
 
                     const form = reactive({
                         name: '',
@@ -829,6 +829,7 @@
                         currentEnv.value = row.env;
                         logVisible.value = true;
                         await fetchRuns(true);
+                        startLogStream();
                     };
 
                     const fetchRuns = async (refreshLog = true) => {
@@ -857,21 +858,13 @@
                     const fetchLogForRun = (run) => {
                         currentRunId.value = run.id || run.run_id;
                         fetchLog(true);
+                        startLogStream();
                     };
 
                     const shouldStickToBottom = () => {
                         const el = logBox.value;
                         if (!el) return true;
                         return el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
-                    };
-
-                    const getCurrentRun = () => {
-                        return runs.value.find((run) => (run.id || run.run_id) === currentRunId.value);
-                    };
-
-                    const isCurrentRunRunning = () => {
-                        const run = getCurrentRun();
-                        return run && run.status === "Running";
                     };
 
                     const fetchLog = async (showLoading = true) => {
@@ -891,29 +884,48 @@
                         } catch(e) { logContent.value = "暂无日志数据"; }
                     };
 
-                    const startLogPolling = () => {
-                        if (logPollTimer.value) clearInterval(logPollTimer.value);
-                        logPollTimer.value = setInterval(async () => {
-                            if (!logVisible.value || !currentTaskId.value) return;
-                            if (isCurrentRunRunning()) {
-                                await fetchRuns(false);
-                            }
-                            await fetchLog(false);
-                        }, 1500);
+                    const stopLogStream = () => {
+                        if (logStream.value) {
+                            logStream.value.close();
+                            logStream.value = null;
+                        }
                     };
 
-                    const stopLogPolling = () => {
-                        if (logPollTimer.value) {
-                            clearInterval(logPollTimer.value);
-                            logPollTimer.value = null;
-                        }
+                    const startLogStream = () => {
+                        stopLogStream();
+                        if (!logVisible.value || !currentTaskId.value || !currentRunId.value) return;
+                        const url = `/api/logs/stream/${currentTaskId.value}?run_id=${currentRunId.value}`;
+                        const source = new EventSource(url);
+                        logStream.value = source;
+                        source.onmessage = async (event) => {
+                            if (!event.data) return;
+                            const stickToBottom = shouldStickToBottom();
+                            logContent.value += `${event.data}\n`;
+                            if (stickToBottom) {
+                                await nextTick();
+                                if (logBox.value) {
+                                    logBox.value.scrollTop = logBox.value.scrollHeight;
+                                }
+                            }
+                        };
+                        source.onerror = () => {
+                            source.close();
+                            if (logVisible.value) {
+                                setTimeout(startLogStream, 1500);
+                            }
+                        };
                     };
 
                     watch(() => logVisible.value, (val) => {
                         if (val) {
-                            startLogPolling();
+                            startLogStream();
                         } else {
-                            stopLogPolling();
+                            stopLogStream();
+                        }
+                    });
+                    watch(() => currentRunId.value, () => {
+                        if (logVisible.value) {
+                            startLogStream();
                         }
                     });
 
@@ -1091,7 +1103,7 @@
                             if (sseEv) sseEv.close();
                             if (pendingRefresh) clearTimeout(pendingRefresh);
                             clearInterval(timer);
-                            stopLogPolling();
+                            stopLogStream();
                         });
                     });
 

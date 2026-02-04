@@ -387,6 +387,8 @@ _client_sse_queues: dict[str, asyncio.Queue] = {}
 _task_processes: dict[str, subprocess.Popen] = {}
 _task_stop_requests: set[str] = set()
 _task_process_lock = threading.Lock()
+_log_sse_queues: dict[str, set[asyncio.Queue]] = {}
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 async def _sse_broadcast_loop():
     # 事件内容仅作触发，不区分类型；取到即向所有 SSE 连接广播 refresh
@@ -402,6 +404,32 @@ async def _sse_broadcast_loop():
                     except Exception:
                         pass
         except queue.Empty:
+            pass
+
+
+def _push_log_line(run_id: str, line: str) -> None:
+    if not line:
+        return
+    if not _main_loop:
+        return
+    queues = _log_sse_queues.get(run_id)
+    if not queues:
+        return
+    for q in list(queues):
+        try:
+            _main_loop.call_soon_threadsafe(q.put_nowait, line)
+        except Exception:
+            pass
+
+
+def _close_log_queues(run_id: str) -> None:
+    if not _main_loop:
+        return
+    queues = _log_sse_queues.pop(run_id, set())
+    for q in list(queues):
+        try:
+            _main_loop.call_soon_threadsafe(q.put_nowait, None)
+        except Exception:
             pass
 
 # --- 消费者：认领 Runnable、创建 Run、执行脚本、更新队列 ---
@@ -449,8 +477,10 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     status = "Failed"
     try:
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+            start_marker = f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n"
+            f.write(start_marker)
             f.flush()
+            _push_log_line(run_id, start_marker)
             process = subprocess.Popen(
                 f'conda run -n {task.conda_env} python -u "{script_path}"',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -462,6 +492,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
             for line in process.stdout:
                 f.write(line)
                 f.flush()
+                _push_log_line(run_id, line)
             process.wait()
             with _task_process_lock:
                 was_stopped = task_id in _task_stop_requests
@@ -477,6 +508,7 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     finally:
         with _task_process_lock:
             _task_processes.pop(task_id, None)
+        _close_log_queues(run_id)
     end_time = datetime.datetime.now()
     duration_ms = int((end_time - start_time).total_seconds() * 1000)
     run.end_time = end_time
@@ -638,6 +670,12 @@ scheduler.start()
 
 # --- FastAPI 接口 ---
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def _capture_main_loop():
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get('/favicon.ico', include_in_schema=False)
@@ -1029,6 +1067,41 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
     db.commit()
     _event_queue.put_nowait("changed")
     return {"status": "stopped"}
+
+@app.get("/api/logs/stream/{task_id}")
+async def stream_logs(task_id: str, run_id: str, request: Request, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    q: asyncio.Queue = asyncio.Queue()
+    _log_sse_queues.setdefault(run_id, set()).add(q)
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    line = await asyncio.wait_for(q.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                if line is None:
+                    break
+                payload = str(line).rstrip("\n")
+                yield f"data: {payload}\n\n"
+        finally:
+            queues = _log_sse_queues.get(run_id)
+            if queues:
+                queues.discard(q)
+                if not queues:
+                    _log_sse_queues.pop(run_id, None)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/api/logs/{task_id}")
 def get_log(task_id: str, run_id: Optional[str] = None, db: Session = Depends(get_db)):
