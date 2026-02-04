@@ -30,16 +30,97 @@
         }
 
         /* 上传区域美化 */
+        .modern-upload {
+            width: 100%;
+        }
+
+        .modern-upload .el-upload {
+            width: 100%;
+        }
+
         .modern-upload .el-upload-dragger {
             border: 2px dashed #e5e7eb;
             background: #f9fafb;
             padding: 20px !important;
             transition: all 0.3s ease;
+            width: 100%;
+            min-height: 150px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
         }
 
         .modern-upload .el-upload-dragger:hover {
             border-color: #2563eb;
             background: #f0f7ff;
+        }
+
+        .modern-upload.is-selected .el-upload-dragger {
+            border-style: solid;
+            border-color: #93c5fd;
+            background: #eff6ff;
+        }
+
+        .modern-upload .el-upload__text {
+            color: #6b7280;
+        }
+
+        .modern-upload .el-upload__text em {
+            color: #2563eb;
+            font-style: normal;
+            font-weight: 600;
+        }
+
+        .modern-upload .el-upload-list {
+            display: none;
+        }
+
+        .upload-placeholder {
+            text-align: center;
+        }
+
+        .upload-selected {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+        }
+
+        .upload-selected__icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            background: #dbeafe;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .upload-selected__meta {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .upload-selected__title {
+            font-weight: 600;
+            color: #1d4ed8;
+            margin-bottom: 4px;
+            font-size: 14px;
+        }
+
+        .upload-selected__name {
+            font-size: 13px;
+            color: #1f2937;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .upload-selected__hint {
+            font-size: 12px;
+            color: #6b7280;
         }
 
         /* 已选文件状态条 */
@@ -51,6 +132,7 @@
             border-radius: 8px;
             margin-top: 10px;
             border: 1px solid #bfdbfe;
+            gap: 8px;
         }
 
         .file-name {
@@ -482,21 +564,29 @@
                 <el-form-item label="Python 算法脚本 (.py)" required>
                     <el-upload
                         class="modern-upload"
+                        :class="{ 'is-selected': !!selectedFile }"
                         action="#" 
                         :auto-upload="false"
                         :on-change="handleFileChange"
                         :limit="1"
+                        :show-file-list="false"
                         drag>
-                        <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-                        <div class="el-upload__text">将算法文件拖到此处，或 <em>点击上传</em></div>
-                    </el-upload>
-                    <transition name="el-fade-in">
-                        <div v-if="selectedFile" class="file-status-bar">
-                            <el-icon color="#2563eb"><document /></el-icon>
-                            <span class="file-name">{{ selectedFile.name }}</span>
-                            <el-icon color="#059669"><circle-check-filled /></el-icon>
+                        <div v-if="!selectedFile" class="upload-placeholder">
+                            <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+                            <div class="el-upload__text">将算法文件拖到此处，或 <em>点击上传</em></div>
                         </div>
-                    </transition>
+                        <div v-else class="upload-selected">
+                            <span class="upload-selected__icon">
+                                <el-icon color="#2563eb"><document /></el-icon>
+                            </span>
+                            <div class="upload-selected__meta">
+                                <div class="upload-selected__title">已选择脚本</div>
+                                <div class="upload-selected__name">{{ selectedFile.name }}</div>
+                                <div class="upload-selected__hint">点击或拖拽替换文件</div>
+                            </div>
+                            <el-icon color="#22c55e"><circle-check-filled /></el-icon>
+                        </div>
+                    </el-upload>
                 </el-form-item>
         
                 <el-row :gutter="20">
