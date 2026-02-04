@@ -511,7 +511,7 @@
             </template>
         </el-dialog>
 
-        <el-dialog v-model="logVisible" :title="currentTaskName" width="900px">
+        <el-dialog v-model="logVisible" :title="currentTaskName" width="900px" @close="stopLogTail">
             <div class="runs-panel">
                 <el-table :data="runs" height="200" size="small" v-loading="runsLoading">
                     <el-table-column prop="start_time" label="开始时间" width="170"></el-table-column>
@@ -678,6 +678,8 @@
                     const currentEnv = ref("");
                     const logContent = ref("");
                     const currentRunId = ref("");
+                    const logTailOffset = ref(0);
+                    const logTailTimer = ref(null);
                     const nowTick = ref(Date.now());
 
                     const form = reactive({
@@ -853,12 +855,51 @@
 
                     const fetchLog = async () => {
                         if(!currentTaskId.value) return;
-                        logContent.value = "Loading...";
+                        logContent.value = "";
+                        logTailOffset.value = 0;
+                        stopLogTail();
+                        await fetchLogTailOnce();
+                        startLogTail();
+                    };
+
+                    const fetchLogTailOnce = async () => {
+                        if (!currentTaskId.value) return;
                         try {
-                            const config = currentRunId.value ? { params: { run_id: currentRunId.value } } : {};
-                            const res = await axios.get(`/api/logs/${currentTaskId.value}`, config);
-                            logContent.value = res.data.content;
-                        } catch(e) { logContent.value = "暂无日志数据"; }
+                            const config = {
+                                params: {
+                                    run_id: currentRunId.value || undefined,
+                                    offset: logTailOffset.value || 0,
+                                    max_bytes: 65536,
+                                },
+                            };
+                            const res = await axios.get(`/api/logs_tail/${currentTaskId.value}`, config);
+                            const payload = res.data || {};
+                            if (payload.data) {
+                                logContent.value += payload.data;
+                            }
+                            if (typeof payload.offset === 'number') {
+                                logTailOffset.value = payload.offset;
+                            }
+                            if (payload.run_id && !currentRunId.value) {
+                                currentRunId.value = payload.run_id;
+                            }
+                        } catch (e) {
+                            logContent.value = logContent.value || "暂无日志数据";
+                        }
+                    };
+
+                    const startLogTail = () => {
+                        if (logTailTimer.value) return;
+                        logTailTimer.value = setInterval(() => {
+                            fetchLogTailOnce();
+                        }, 1000);
+                    };
+
+                    const stopLogTail = () => {
+                        if (logTailTimer.value) {
+                            clearInterval(logTailTimer.value);
+                            logTailTimer.value = null;
+                        }
                     };
 
                     const getElapsedSeconds = (row) => {
@@ -1035,6 +1076,7 @@
                             if (sseEv) sseEv.close();
                             if (pendingRefresh) clearTimeout(pendingRefresh);
                             clearInterval(timer);
+                            stopLogTail();
                         });
                     });
 
@@ -1046,7 +1088,7 @@
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
                         Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
-                        deleteTask
+                        deleteTask, stopLogTail
                     };
                 }
             });
