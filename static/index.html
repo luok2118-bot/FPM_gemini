@@ -540,8 +540,8 @@
             destroy-on-close>
             
             <el-form :model="form" label-position="top" class="modern-form">
-                <el-form-item label="任务识别名称" required>
-                    <el-input v-model="form.name" placeholder="建议格式: 策略名_频率_版本 (e.g., Alpha101_Daily_V1)" size="default">
+                <el-form-item label="任务名称" required>
+                    <el-input v-model="form.name" placeholder="任务名称" size="default">
                         <template #prefix><el-icon><edit-pen /></el-icon></template>
                     </el-input>
                 </el-form-item>
@@ -561,7 +561,7 @@
                     </div>
                 </el-form-item>
         
-                <el-form-item label="Python 算法脚本 (.py)" required>
+                <el-form-item label="Python 任务脚本 (.py)" required>
                     <el-upload
                         class="modern-upload"
                         :class="{ 'is-selected': !!selectedFile }"
@@ -573,7 +573,7 @@
                         drag>
                         <div v-if="!selectedFile" class="upload-placeholder">
                             <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-                            <div class="el-upload__text">将算法文件拖到此处，或 <em>点击上传</em></div>
+                            <div class="el-upload__text">将任务文件拖到此处，或 <em>点击上传</em></div>
                         </div>
                         <div v-else class="upload-selected">
                             <span class="upload-selected__icon">
