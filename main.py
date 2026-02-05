@@ -413,12 +413,16 @@ def evaluate_queue_item(db: Session, job: JobQueue) -> str:
 def evaluate_pending_and_wait(db: Session):
     """扫描 status in (Pending, Wait) 的队列表项，按依赖更新为 Runnable 或 Wait。"""
     now = datetime.datetime.now()
+    has_changes = False
     for job in db.query(JobQueue).filter(JobQueue.status.in_(["Pending", "Wait"])).all():
         new_status = evaluate_queue_item(db, job)
         if job.status != new_status:
             job.status = new_status
             job.updated_at = now
+            has_changes = True
     db.commit()
+    if has_changes:
+        _event_queue.put_nowait("update")
 
 
 _consumer_stop = threading.Event()
@@ -442,7 +446,6 @@ def _eval_loop():
 # --- 事件推送逻辑 ---
 _event_queue = queue.Queue()
 _sse_queues: set = set()
-_client_sse_queues: dict[str, asyncio.Queue] = {}
 _task_processes: dict[str, subprocess.Popen] = {}
 _task_stop_requests: set[str] = set()
 _task_process_lock = threading.Lock()
@@ -607,6 +610,7 @@ def _claim_runnable_job(db: Session):
         if rows == 0:
             continue
         db.refresh(candidate)
+        _event_queue.put_nowait("update")
         return candidate, True
     db.commit()
     return None, False
@@ -658,6 +662,7 @@ def _consumer_worker():
             task.last_run = run_id
             job.run_id = run_id
             db.commit()
+            _event_queue.put_nowait("update")
             final_status = _run_task_script(db, task_id, run_id, trigger_type, run_date)
             if final_status == "Wait":
                 job.status = "Wait"
@@ -732,6 +737,7 @@ async def startup():
         t.start()
         _consumer_threads.append(t)
     asyncio.create_task(_sse_broadcast_loop())
+    _event_queue.put_nowait("update")
 
 @app.on_event("shutdown")
 def on_shutdown():
@@ -753,18 +759,8 @@ SSE_HEADERS = {
 
 @app.get("/api/events")
 async def sse_events(request: Request):
-    client_id = request.client.host if request.client else "unknown"
-    if client_id in _client_sse_queues:
-        old_q = _client_sse_queues[client_id]
-        try:
-            old_q.put_nowait(None)
-        except Exception:
-            pass
-        _sse_queues.discard(old_q)
-        del _client_sse_queues[client_id]
     q = asyncio.Queue()
     _sse_queues.add(q)
-    _client_sse_queues[client_id] = q
 
     async def stream():
         try:
@@ -781,8 +777,6 @@ async def sse_events(request: Request):
                     break
         finally:
             _sse_queues.discard(q)
-            if _client_sse_queues.get(client_id) == q:
-                _client_sse_queues.pop(client_id, None)
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",

@@ -850,7 +850,7 @@
 
     <script>
         const initApp = () => {
-            const { createApp, ref, reactive, computed, nextTick, onMounted, onUnmounted } = Vue;
+            const { createApp, ref, reactive, computed, nextTick, watch, onMounted, onUnmounted } = Vue;
             const { Plus, VideoPlay, Document, Refresh, Delete, CircleClose } = ElementPlusIconsVue;
 
             const app = createApp({
@@ -1271,6 +1271,30 @@
                         }
                     };
 
+                    let drawerPollTimer = null;
+                    const drawerSync = async () => {
+                        await fetchTasks(false);
+                        if (logVisible.value && logDrawerTask.value) {
+                            const id = logDrawerTask.value.id;
+                            const found = tasks.value.find(t => (t.id == id || String(t.id) === String(id)));
+                            if (found) logDrawerTask.value = { ...found };
+                        }
+                        if (logVisible.value && currentTaskId.value) {
+                            await refreshRunsAndMaybeSwitch();
+                        }
+                    };
+                    watch(logVisible, (open) => {
+                        if (open) {
+                            drawerSync();
+                            if (!drawerPollTimer) drawerPollTimer = setInterval(() => drawerSync(), 1500);
+                        } else {
+                            if (drawerPollTimer) {
+                                clearInterval(drawerPollTimer);
+                                drawerPollTimer = null;
+                            }
+                        }
+                    });
+
                     onMounted(() => {
                         fetchTasks();
                         fetchEnvs();
@@ -1283,17 +1307,30 @@
                         let pendingRefresh = null;
                         let sseEv = null;
                         let sseIdleCheckTimer = null;
-                        const doRefresh = () => {
-                            if (!loading.value) {
-                                fetchTasks(false);
-                                fetchQueue();
+                        let refreshing = false;
+                        const doRefresh = async () => {
+                            if (refreshing) return;
+                            refreshing = true;
+                            try {
+                                await fetchTasks(false);
+                                await fetchQueue();
+                                if (logVisible.value && logDrawerTask.value) {
+                                    const id = logDrawerTask.value.id;
+                                    const found = tasks.value.find(t => (t.id == id || String(t.id) === String(id)));
+                                    if (found) logDrawerTask.value = { ...found };
+                                }
+                                if (logVisible.value && currentTaskId.value) {
+                                    await refreshRunsAndMaybeSwitch();
+                                }
+                            } finally {
                                 lastRefresh = Date.now();
+                                refreshing = false;
                             }
                         };
                         const onSSEMessage = () => {
-                            lastSSEMessageAt = Date.now();
                             const now = Date.now();
-                            if (now - lastRefresh >= MIN_INTERVAL) {
+                            const drawerOpen = logVisible.value;
+                            if (drawerOpen || now - lastRefresh >= MIN_INTERVAL) {
                                 doRefresh();
                             } else if (!pendingRefresh) {
                                 pendingRefresh = setTimeout(() => {
@@ -1306,7 +1343,11 @@
                             if (sseEv) sseEv.close();
                             sseEv = new EventSource('/api/events');
                             lastSSEMessageAt = Date.now();
-                            sseEv.onmessage = onSSEMessage;
+                            sseEv.onmessage = (e) => {
+                                lastSSEMessageAt = Date.now();
+                                if (e.data !== 'refresh') return;
+                                onSSEMessage();
+                            };
                             sseEv.onerror = () => {
                                 sseEv.close();
                                 setTimeout(connectSSE, 2000);
@@ -1323,6 +1364,10 @@
                             nowTick.value = Date.now();
                         }, 1000);
                         onUnmounted(() => {
+                            if (drawerPollTimer) {
+                                clearInterval(drawerPollTimer);
+                                drawerPollTimer = null;
+                            }
                             if (sseIdleCheckTimer) clearInterval(sseIdleCheckTimer);
                             if (sseEv) sseEv.close();
                             if (pendingRefresh) clearTimeout(pendingRefresh);
