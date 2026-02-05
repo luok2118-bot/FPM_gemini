@@ -469,9 +469,9 @@
                         </template>
                     </el-table-column>
 
-                    <el-table-column label="环境配置" width="140">
+                    <el-table-column label="Conda 环境" width="140">
                         <template #default="scope">
-                            <span class="env-tag">conda: {{ scope.row.env }}</span>
+                            <span class="env-tag">{{ scope.row.env }}</span>
                         </template>
                     </el-table-column>
 
@@ -686,7 +686,7 @@
                     <div class="log-drawer-task-row" v-if="logDrawerTask">
                         <div class="task-name">{{ logDrawerTask.name }}</div>
                         <div class="task-meta">{{ logDrawerTask.script }}</div>
-                        <span class="env-tag">conda: {{ logDrawerTask.env }}</span>
+                        <span class="env-tag">{{ logDrawerTask.env }}</span>
                         <span class="task-meta">每天 {{ logDrawerTask.schedule }}</span>
                         <el-tag size="small" :type="logDrawerTask.task_type === 'market' ? 'success' : 'info'">
                             {{ logDrawerTask.task_type === 'market' ? '行情更新' : '因子计算' }}

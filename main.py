@@ -18,6 +18,10 @@ try:
         LOG_RETENTION_DAYS,
         JOB_QUEUE_RETENTION_DAYS,
         RUN_RETENTION_DAYS,
+        TRADING_CALENDAR_CSV,
+        TRADING_CALENDAR_AUTO_FETCH,
+        TRADING_CALENDAR_FETCH_START,
+        TRADING_CALENDAR_FETCH_END_DAYS_AHEAD,
     )
 except ImportError:
     QUEUE_WORKER_CONCURRENCY = 1
@@ -25,6 +29,10 @@ except ImportError:
     LOG_RETENTION_DAYS = 7
     JOB_QUEUE_RETENTION_DAYS = 7
     RUN_RETENTION_DAYS = 30
+    TRADING_CALENDAR_CSV = None
+    TRADING_CALENDAR_AUTO_FETCH = False
+    TRADING_CALENDAR_FETCH_START = "20140101"
+    TRADING_CALENDAR_FETCH_END_DAYS_AHEAD = 365
 
 from loguru import logger
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
@@ -35,12 +43,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from sqlalchemy import create_engine, Column, String, DateTime, Date, Integer, Float, event, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+# 交易日历
+from trading_calendar import ensure_calendar, is_trading_day as calendar_is_trading_day
 
 # --- 基础配置 ---
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = BASE_DIR / "tasks_data"
 DATA_ROOT.mkdir(exist_ok=True)
 DB_PATH = f"sqlite:///{BASE_DIR}/database.db"
+# 交易日历路径：若未配置，则默认使用项目根目录下的 trading_calendar.csv
+if not TRADING_CALENDAR_CSV:
+    TRADING_CALENDAR_CSV = str(BASE_DIR / "trading_calendar.csv")
+else:
+    TRADING_CALENDAR_CSV = str(Path(TRADING_CALENDAR_CSV).expanduser())
 
 # --- 服务器日志（按日轮转，保留 LOG_RETENTION_DAYS）---
 # 只记录异常/警告/错误，任务运行情况由任务自行打印，服务不做过多打印
@@ -54,6 +69,21 @@ logger.add(
     level="DEBUG",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
     enqueue=True,
+)
+
+# 初始化交易日历：
+# - 若 TRADING_CALENDAR_AUTO_FETCH 为 True 且 csv 不存在，则参考 raw_data_hy 在线拉取日历后再加载
+# - 否则直接加载本地 csv，缺失时回退到工作日逻辑并记录警告
+_calendar_end_date = (
+    datetime.date.today() + datetime.timedelta(days=int(TRADING_CALENDAR_FETCH_END_DAYS_AHEAD or 0))
+).strftime("%Y%m%d")
+TRADING_CALENDAR = ensure_calendar(
+    Path(TRADING_CALENDAR_CSV),
+    fallback_weekday=True,
+    auto_fetch_online=bool(TRADING_CALENDAR_AUTO_FETCH),
+    fetch_start_date=str(TRADING_CALENDAR_FETCH_START),
+    fetch_end_date=_calendar_end_date,
+    secu_market=83,
 )
 
 # --- 数据库定义 ---
@@ -213,8 +243,8 @@ def _get_task_dir(task: Task) -> Path:
 
 
 def _is_trading_day(day: datetime.date) -> bool:
-    """简易交易日判断：周一至周五为交易日。"""
-    return day.weekday() < 5
+    """使用独立交易日历进行判断；缺失或越界时回退到工作日逻辑。"""
+    return calendar_is_trading_day(day)
 
 
 def _parse_bool(value: Optional[str]) -> bool:

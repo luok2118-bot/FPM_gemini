@@ -15,3 +15,14 @@ RUN_RETENTION_DAYS = 30
 
 # 输出保留天数（仅用于因子计算任务；行情更新任务始终只保留一个输出）
 OUTPUT_RETENTION_DAYS = 3
+
+# 交易日历 CSV 路径（默认为项目根目录下的 trading_calendar.csv）
+TRADING_CALENDAR_CSV = "trading_calendar.csv"
+
+# 交易日历自动拉取配置（参考 raw_data_hy 的日历获取逻辑）
+# 是否在文件缺失时自动从数据源拉取
+TRADING_CALENDAR_AUTO_FETCH = True
+# 拉取的起始日期（包含），格式 YYYYMMDD
+TRADING_CALENDAR_FETCH_START = "20140101"
+# 拉取的结束日期偏移（相对今天往后若干天，默认一年）
+TRADING_CALENDAR_FETCH_END_DAYS_AHEAD = 365
