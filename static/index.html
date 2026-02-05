@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QuantAlpha | 因子计算中台</title>
+    <title>FactorPlatform | 因子计算平台</title>
     <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -355,24 +355,7 @@
             background: rgba(110, 118, 129, 0.2);
             color: #8b949e;
         }
-        .runs-panel {
-            margin-bottom: 12px;
-        }
-        .runs-panel-toolbar {
-            margin-bottom: 8px;
-        }
 
-        .runs-panel .el-table {
-            --el-table-header-bg-color: #111827;
-            --el-table-header-text-color: #e5e7eb;
-            --el-table-row-hover-bg-color: #1f2937;
-            background: #0f172a;
-        }
-
-        .run-log-button {
-            font-size: 12px;
-        }
-        
         .env-tag {
             background: #f3f4f6;
             color: #374151;
@@ -390,7 +373,7 @@
             <div class="header-content">
                 <div class="brand">
                     <el-icon :size="24"><data-line></data-line></el-icon>
-                    <span>QuantAlpha Engine</span>
+                    <span>FactorPlatform</span>
                 </div>
                 <el-button type="primary" @click="dialogVisible = true" :icon="Plus">
                     新建计算任务
@@ -643,29 +626,6 @@
         </el-dialog>
 
         <el-dialog v-model="logVisible" :title="currentTaskName" class="log-dialog" @close="stopLogTail">
-            <div class="runs-panel">
-                <div class="runs-panel-toolbar">
-                    <el-button size="small" @click="refreshRunsAndMaybeSwitch()">刷新运行列表</el-button>
-                </div>
-                <el-table :data="runs" height="200" size="small" v-loading="runsLoading">
-                    <el-table-column prop="start_time" label="开始时间" width="170"></el-table-column>
-                    <el-table-column prop="status" label="状态" width="110"></el-table-column>
-                    <el-table-column prop="duration" label="耗时(s)" width="100">
-                        <template #default="scope">
-                            {{ scope.row.duration ? scope.row.duration.toFixed(2) : '-' }}
-                        </template>
-                    </el-table-column>
-                    <el-table-column prop="exit_code" label="退出码" width="80"></el-table-column>
-                    <el-table-column prop="log_path" label="日志路径"></el-table-column>
-                    <el-table-column label="操作" width="110">
-                        <template #default="scope">
-                            <el-button type="primary" text class="run-log-button" @click="fetchLogForRun(scope.row)">
-                                查看日志
-                            </el-button>
-                        </template>
-                    </el-table-column>
-                </el-table>
-            </div>
             <div class="log-container">
                 <div class="log-header">
                     <div style="display: flex; align-items: center; gap: 12px;">
@@ -674,15 +634,16 @@
                             v-model="currentRunId"
                             size="small"
                             placeholder="选择运行记录"
-                            style="min-width: 240px;"
+                            style="min-width: 320px;"
                             @change="fetchLog">
                             <el-option
                                 v-for="run in runs"
                                 :key="run.id"
-                                :label="`${run.started_at || run.id} (${run.status})`"
+                                :label="runLogOptionLabel(run)"
                                 :value="run.id">
                             </el-option>
                         </el-select>
+                        <el-button size="small" @click="refreshRunsAndMaybeSwitch()">刷新运行列表</el-button>
                         <span v-if="currentRunStatus === 'Running'" class="log-status-badge log-status-live">实时</span>
                         <span v-else-if="currentRunStatus" class="log-status-badge log-status-ended">已结束</span>
                     </div>
@@ -1022,6 +983,14 @@
                         }
                     };
 
+                    const runLogOptionLabel = (run) => {
+                        const time = run.started_at ?? run.start_time ?? '-';
+                        const status = run.status ?? '-';
+                        const duration = run.duration != null ? run.duration.toFixed(1) + 's' : '-';
+                        const exit = run.exit_code != null ? String(run.exit_code) : '-';
+                        return `${time} | ${status} | ${duration} | ${exit}`;
+                    };
+
                     const fetchLogForRun = (run) => {
                         currentRunId.value = run.id || run.run_id;
                         fetchLog();
@@ -1276,6 +1245,7 @@
                         runs, runsLoading, queueItems, queueLoading, fetchQueue,
                         currentTaskName, currentEnv, logContent, logLoading, logError, logErrorMessage,
                         logContentEl, currentRunStatus, currentRunId, nowTick,
+                        runLogOptionLabel,
                         handleFileChange, createTask, runNow, viewLogs, fetchLog, fetchRuns, refreshRunsAndMaybeSwitch, fetchTasks,
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
