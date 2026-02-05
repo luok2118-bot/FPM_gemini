@@ -16,18 +16,24 @@ try:
         QUEUE_WORKER_CONCURRENCY,
         QUEUE_EVAL_INTERVAL_SEC,
         LOG_RETENTION_DAYS,
+        JOB_QUEUE_RETENTION_DAYS,
+        RUN_RETENTION_DAYS,
     )
 except ImportError:
     QUEUE_WORKER_CONCURRENCY = 1
     QUEUE_EVAL_INTERVAL_SEC = 3
     LOG_RETENTION_DAYS = 7
+    JOB_QUEUE_RETENTION_DAYS = 7
+    RUN_RETENTION_DAYS = 30
 
+from loguru import logger
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from sqlalchemy import create_engine, Column, String, DateTime, Date, Integer, Float, event, func
+from sqlalchemy import create_engine, Column, String, DateTime, Date, Integer, Float, event, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # --- 基础配置 ---
@@ -35,6 +41,20 @@ BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = BASE_DIR / "tasks_data"
 DATA_ROOT.mkdir(exist_ok=True)
 DB_PATH = f"sqlite:///{BASE_DIR}/database.db"
+
+# --- 服务器日志（按日轮转，保留 LOG_RETENTION_DAYS）---
+# 只记录异常/警告/错误，任务运行情况由任务自行打印，服务不做过多打印
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+logger.remove()
+logger.add(
+    LOG_DIR / "server_{time:YYYY-MM-DD}.log",
+    rotation="00:00",
+    retention=f"{LOG_RETENTION_DAYS} days",
+    level="DEBUG",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+    enqueue=True,
+)
 
 # --- 数据库定义 ---
 Base = declarative_base()
@@ -217,12 +237,43 @@ def _cleanup_task_logs(task_dir: Path):
             if log_file.stat().st_mtime < cutoff:
                 log_file.unlink(missing_ok=True)
         except Exception:
+            logger.opt(exception=True).warning("cleanup task log failed path={}", log_file)
             pass
 
 
 def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[Path]):
     """输出目录由任务脚本自行管理，系统不做自动清理。"""
     pass
+
+
+def _cleanup_job_queue(db: Session) -> int:
+    """删除 job_queue 中终态且超过保留天数的记录。"""
+    retention_days = max(int(JOB_QUEUE_RETENTION_DAYS or 0), 0)
+    if retention_days <= 0:
+        return 0
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=retention_days)
+    r = db.execute(
+        text("""
+            DELETE FROM job_queue
+            WHERE status IN ('Success', 'Failed', 'Stopped', 'Skipped')
+              AND updated_at < :cutoff
+        """),
+        {"cutoff": cutoff},
+    )
+    return r.rowcount
+
+
+def _cleanup_runs(db: Session) -> int:
+    """删除 runs 中 start_time 超过保留天数的记录。"""
+    retention_days = max(int(RUN_RETENTION_DAYS or 0), 0)
+    if retention_days <= 0:
+        return 0
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=retention_days)
+    r = db.execute(
+        text("DELETE FROM runs WHERE start_time < :cutoff"),
+        {"cutoff": cutoff},
+    )
+    return r.rowcount
 
 
 def _resolve_run_log_file(task_dir: Path, log_path: Optional[str]) -> Path:
@@ -250,11 +301,13 @@ def _stop_process_windows(process: subprocess.Popen) -> tuple[bool, str, Optiona
             process.wait(timeout=2)
             return True, "force killed", process.returncode
     except Exception as exc:
+        logger.opt(exception=True).warning("stop process error")
         try:
             process.kill()
             process.wait(timeout=2)
             return True, f"kill due to error: {exc}", process.returncode
         except Exception as kill_exc:
+            logger.opt(exception=True).warning("stop process kill failed")
             return False, f"failed to stop process: {kill_exc}", process.returncode
 
 
@@ -438,6 +491,7 @@ def _eval_loop():
         try:
             evaluate_pending_and_wait(db)
         except Exception:
+            logger.exception("queue eval failed")
             pass
         finally:
             db.close()
@@ -462,6 +516,7 @@ async def _sse_broadcast_loop():
                     try:
                         q.put_nowait(msg)
                     except Exception:
+                        logger.opt(exception=True).debug("sse broadcast put failed")
                         pass
         except queue.Empty:
             pass
@@ -471,93 +526,129 @@ def _run_task_script(db: Session, task_id: str, run_id: str, trigger_type: str, 
     """
     执行已存在的 Run 对应脚本。假定 Run 已创建且上游已满足。
     若执行前再次检查发现上游未完成，返回 "Wait"；否则执行并返回终态 "Success"|"Failed"|"Stopped"。
+    内部用两层 try/except 保证任何异常都会更新 Run/Task 状态并返回，绝不向外抛异常。
     """
     run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
     task = db.query(Task).filter(Task.id == task_id).first()
     if not run or not task:
         return "Failed"
-    task_dir = _get_task_dir(task)
-    script_dir = task_dir / "script"
-    script_path = task_dir / "script" / task.script_name
-    task_output_dir = task_dir / "output"
-    log_file = _resolve_run_log_file(task_dir, run.log_path)
-
-    upstream_task_dir = ""
-    upstream_script_dir = ""
-    if task.upstream_id:
-        upstream_task = db.query(Task).filter(Task.id == task.upstream_id).first()
-        if not upstream_task:
-            return "Wait"
-        if _upstream_job_running(db, task.upstream_id):
-            return "Wait"
-        if not _upstream_success_for_date(db, task.upstream_id, run_date):
-            return "Wait"
-        upstream_task_dir = str(_get_task_dir(upstream_task))
-        upstream_script_dir = str(upstream_task_dir / "script")
-    env_vars = os.environ.copy()
-    env_vars.update({
-        "SCRIPT_DIR" : str(script_dir),
-        "SCRIPT_PATH": str(script_path),
-        "TASK_ID": task_id,
-        "OUTPUT_PATH": str(task_output_dir),
-        "OUTPUT_DIR": str(task_output_dir),
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONIOENCODING": "utf-8",
-    })
-    if task.upstream_id:
-        env_vars["UPSTREAM_TASK_DIR"] = upstream_task_dir
-        env_vars["UPSTREAM_SCRIPT_DIR"] = upstream_script_dir
-    start_time = run.start_time
-    exit_code = None
     status = "Failed"
+    exit_code = None
+    task_dir: Optional[Path] = None
     try:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
-            f.flush()
-            is_windows = os.name == "nt"
-            creationflags = 0
-            if is_windows and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            process = subprocess.Popen(
-                f'conda run --no-capture-output -n {task.conda_env} python -u "{script_path}"',
-                shell=True,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env_vars,
-                creationflags=creationflags,
-                start_new_session=not is_windows,
-            )
+        # 路径构建：统一用 Path 拼接，仅在传给出进程/环境变量时转为 str
+        # 结构: task_dir/script/{script_name}, task_dir/output, task_dir/logs/...
+        task_dir = _get_task_dir(task)
+        script_dir = task_dir / "script"
+        script_path = script_dir / task.script_name
+        task_output_dir = task_dir / "output"
+        log_file = _resolve_run_log_file(task_dir, run.log_path)
+
+        upstream_task_dir_str = ""
+        upstream_script_dir_str = ""
+        if task.upstream_id:
+            upstream_task = db.query(Task).filter(Task.id == task.upstream_id).first()
+            if not upstream_task:
+                return "Wait"
+            if _upstream_job_running(db, task.upstream_id):
+                return "Wait"
+            if not _upstream_success_for_date(db, task.upstream_id, run_date):
+                return "Wait"
+            upstream_dir = _get_task_dir(upstream_task)
+            upstream_task_dir_str = str(upstream_dir)
+            upstream_script_dir_str = str(upstream_dir / "script")
+
+        env_vars = os.environ.copy()
+        env_vars.update({
+            "SCRIPT_DIR": str(script_dir),
+            "SCRIPT_PATH": str(script_path),
+            "TASK_ID": task_id,
+            "OUTPUT_PATH": str(task_output_dir),
+            "OUTPUT_DIR": str(task_output_dir),
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+        })
+        if task.upstream_id:
+            env_vars["UPSTREAM_TASK_DIR"] = upstream_task_dir_str
+            env_vars["UPSTREAM_SCRIPT_DIR"] = upstream_script_dir_str
+        start_time = run.start_time
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*20} START {datetime.datetime.now()} {'='*20}\n")
+                f.flush()
+                is_windows = os.name == "nt"
+                creationflags = 0
+                if is_windows and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                script_path_str = str(script_path)
+                process = subprocess.Popen(
+                    f'conda run --no-capture-output -n {task.conda_env} python -u "{script_path_str}"',
+                    shell=True,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    env=env_vars,
+                    creationflags=creationflags,
+                    start_new_session=not is_windows,
+                )
+                with _task_process_lock:
+                    _task_processes[task_id] = process
+                process.wait()
+                with _task_process_lock:
+                    was_stopped = task_id in _task_stop_requests
+                    _task_stop_requests.discard(task_id)
+                if was_stopped:
+                    status = "Stopped"
+                else:
+                    status = "Success" if process.returncode == 0 else "Failed"
+                exit_code = process.returncode
+        except Exception as exc:
+            logger.exception("task run execution error", task_id=task_id, run_id=run_id)
+            status = "Failed"
+            run.message = f"Execution error: {exc}"
+        finally:
             with _task_process_lock:
-                _task_processes[task_id] = process
-            process.wait()
-            with _task_process_lock:
-                was_stopped = task_id in _task_stop_requests
-                _task_stop_requests.discard(task_id)
-            if was_stopped:
-                status = "Stopped"
-            else:
-                status = "Success" if process.returncode == 0 else "Failed"
-            exit_code = process.returncode
-    except Exception as exc:
-        status = "Failed"
-        run.message = f"Execution error: {exc}"
-    finally:
+                _task_processes.pop(task_id, None)
+        end_time = datetime.datetime.now()
+        duration_ms = int((end_time - start_time).total_seconds() * 1000)
+        run.end_time = end_time
+        run.exit_code = exit_code
+        run.status = status
+        run.duration_ms = duration_ms
+        task.status = status
+        task.last_run = run_id
+        db.commit()
+        _cleanup_task_logs(task_dir)
+        _cleanup_task_outputs(task, task_dir, None)
+        _event_queue.put_nowait("update")
+        return status
+    except Exception as e:
+        # 外层兜底：任意异常（如 _get_task_dir、open、Popen 前失败）都保证 Run/Task 被标为 Failed，避免监控永远 Running
+        logger.exception("task run outer error", task_id=task_id, run_id=run_id)
+        run.message = str(e)
+        run.end_time = datetime.datetime.now()
+        run.exit_code = None
+        run.status = "Failed"
+        if run.start_time:
+            run.duration_ms = int((run.end_time - run.start_time).total_seconds() * 1000)
+        task.status = "Failed"
+        task.last_run = run_id
         with _task_process_lock:
             _task_processes.pop(task_id, None)
-    end_time = datetime.datetime.now()
-    duration_ms = int((end_time - start_time).total_seconds() * 1000)
-    run.end_time = end_time
-    run.exit_code = exit_code
-    run.status = status
-    run.duration_ms = duration_ms
-    task.status = status
-    task.last_run = run_id
-    db.commit()
-    _cleanup_task_logs(task_dir)
-    _cleanup_task_outputs(task, task_dir, None)
-    _event_queue.put_nowait("update")
-    return status
+        try:
+            db.commit()
+        except Exception:
+            logger.exception("task run outer commit failed", task_id=task_id, run_id=run_id)
+            pass
+        if task_dir is not None:
+            try:
+                _cleanup_task_logs(task_dir)
+                _cleanup_task_outputs(task, task_dir, None)
+            except Exception:
+                logger.exception("task run outer cleanup failed", task_id=task_id)
+                pass
+        _event_queue.put_nowait("update")
+        return "Failed"
 
 
 def _can_claim_job(db: Session, job: JobQueue) -> bool:
@@ -677,17 +768,30 @@ def _consumer_worker():
                 job.updated_at = datetime.datetime.now()
                 db.commit()
         except Exception as e:
+            logger.exception("consumer worker error", job_id=job.id if job else None, task_id=job.task_id if job else None)
             if job:
                 job.status = "Failed"
                 job.message = str(e)
                 job.updated_at = datetime.datetime.now()
+                # 兜底：防止 _run_task_script 抛异常时 Task/Run 一直停在 Running
+                task_for_fix = db.query(Task).filter(Task.id == job.task_id).first()
+                if task_for_fix and task_for_fix.status == "Running":
+                    task_for_fix.status = "Failed"
+                    if job.run_id:
+                        run_for_fix = db.query(Run).filter(Run.id == job.run_id, Run.task_id == job.task_id).first()
+                        if run_for_fix:
+                            run_for_fix.status = "Failed"
+                            run_for_fix.end_time = datetime.datetime.now()
+                            run_for_fix.message = str(e)
                 try:
                     db.commit()
                 except Exception:
+                    logger.exception("consumer worker commit failed")
                     pass
             try:
                 db.close()
             except Exception:
+                logger.exception("consumer worker close failed")
                 pass
         else:
             db.close()
@@ -702,13 +806,61 @@ try:
         conn.execute(text("DELETE FROM apscheduler_jobs"))
         conn.commit()
 except Exception:
+    logger.opt(exception=True).warning("apscheduler init cleanup failed")
     pass  # 表不存在或首次运行则忽略
 scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=engine)})
 scheduler.start()
 
+
+def _run_db_cleanup():
+    """定时清理 job_queue 和 runs 超期记录。"""
+    db = SessionLocal()
+    try:
+        jq_deleted = _cleanup_job_queue(db)
+        runs_deleted = _cleanup_runs(db)
+        db.commit()
+        if jq_deleted or runs_deleted:
+            logger.info("db cleanup done: job_queue={} runs={}", jq_deleted, runs_deleted)
+    except Exception:
+        logger.opt(exception=True).warning("db cleanup failed")
+        db.rollback()
+    finally:
+        db.close()
+
+
+scheduler.add_job(_run_db_cleanup, "cron", hour=2, minute=0, id="db_cleanup")
+
 # --- FastAPI 接口 ---
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """记录所有未捕获异常到服务器日志，再按默认行为返回响应。"""
+    if isinstance(exc, RequestValidationError):
+        logger.warning("request validation error {} {}: {}", request.method, request.url.path, exc.errors())
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    if isinstance(exc, HTTPException):
+        logger.warning("http exception {} {}: {} {}", request.method, request.url.path, exc.status_code, exc.detail)
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    logger.exception("unhandled exception {} {}", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
+@app.middleware("http")
+async def log_error_requests(request: Request, call_next):
+    """记录 4xx/5xx 请求到服务器日志，不修改响应。"""
+    start = time.perf_counter()
+    response = await call_next(request)
+    if response.status_code >= 400:
+        elapsed = time.perf_counter() - start
+        logger.warning(
+            "request {} {} -> {} ({} s)",
+            request.method, request.url.path, response.status_code, round(elapsed, 3),
+        )
+    return response
+
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
@@ -745,10 +897,12 @@ def on_shutdown():
     try:
         scheduler.shutdown(wait=False)
     except Exception:
+        logger.opt(exception=True).warning("shutdown error")
         pass
     try:
         engine.dispose()
     except Exception:
+        logger.opt(exception=True).warning("shutdown error")
         pass
 
 SSE_HEADERS = {
@@ -771,6 +925,8 @@ async def sse_events(request: Request):
                     msg = "data: ping\n\n"
                 if msg is None:
                     break
+                if await request.is_disconnected():
+                    break
                 try:
                     yield msg
                 except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError, ConnectionError):
@@ -789,6 +945,7 @@ def get_envs():
         output = subprocess.check_output("conda env list", shell=True, text=True)
         return [line.split()[0] for line in output.splitlines() if line and not line.startswith("#")]
     except Exception:
+        logger.opt(exception=True).warning("conda env list failed")
         return ["base"]
 
 @app.get("/api/tasks")
@@ -968,6 +1125,7 @@ async def update_task(
             scheduler.add_job(enqueue_job, 'cron', hour=int(h), minute=int(m), id=task_id, args=[task_id, "cron"])
     except Exception as exc:
         # 仅记录错误，不阻塞任务基础信息更新
+        logger.exception("update schedule failed task_id={}", task_id)
         raise HTTPException(status_code=500, detail=f"Update schedule failed: {exc}")
 
     _event_queue.put_nowait("changed")
@@ -1187,11 +1345,14 @@ def get_log_tail(
     }
 
 @app.get("/api/runs/{task_id}")
-def list_runs(task_id: str, db: Session = Depends(get_db)):
+def list_runs(task_id: str, limit: int = 200, db: Session = Depends(get_db)):
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be positive")
     runs = (
         db.query(Run)
         .filter(Run.task_id == task_id)
         .order_by(Run.start_time.desc())
+        .limit(min(limit, 500))
         .all()
     )
     return [
