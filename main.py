@@ -45,6 +45,7 @@ from sqlalchemy import create_engine, Column, String, DateTime, Date, Integer, F
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # 交易日历
 from trading_calendar import ensure_calendar, is_trading_day as calendar_is_trading_day
+from send_dingding import notify_task_result, notify_startup
 
 # --- 基础配置 ---
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -757,6 +758,7 @@ def _consumer_worker():
                 job.message = "Task not found"
                 job.updated_at = datetime.datetime.now()
                 db.commit()
+                notify_task_result(task_id, "Failed", job.run_date, "Task not found", end_time=datetime.datetime.now())
                 db.close()
                 continue
             start_time = datetime.datetime.now()
@@ -793,10 +795,13 @@ def _consumer_worker():
                     run.end_time = datetime.datetime.now()
                     run.message = "Upstream not ready (race)"
                 db.commit()
+                notify_task_result(task.name, "Failed", run_date, "Upstream not ready", end_time=run.end_time if run else None)
             else:
                 job.status = final_status
                 job.updated_at = datetime.datetime.now()
                 db.commit()
+                run = db.query(Run).filter(Run.id == run_id, Run.task_id == task_id).first()
+                notify_task_result(task.name, final_status, run_date, run.message if run else None, run.duration_ms if run else None, end_time=run.end_time if run else None)
         except Exception as e:
             logger.exception("consumer worker error", job_id=job.id if job else None, task_id=job.task_id if job else None)
             if job:
@@ -818,6 +823,7 @@ def _consumer_worker():
                 except Exception:
                     logger.exception("consumer worker commit failed")
                     pass
+                notify_task_result(task_for_fix.name if task_for_fix else job.task_id, "Failed", job.run_date, job.message, end_time=datetime.datetime.now())
             try:
                 db.close()
             except Exception:
@@ -920,6 +926,7 @@ async def startup():
         _consumer_threads.append(t)
     asyncio.create_task(_sse_broadcast_loop())
     _event_queue.put_nowait("update")
+    notify_startup()
 
 @app.on_event("shutdown")
 def on_shutdown():
