@@ -16,13 +16,11 @@ try:
         QUEUE_WORKER_CONCURRENCY,
         QUEUE_EVAL_INTERVAL_SEC,
         LOG_RETENTION_DAYS,
-        OUTPUT_RETENTION_DAYS,
     )
 except ImportError:
     QUEUE_WORKER_CONCURRENCY = 1
     QUEUE_EVAL_INTERVAL_SEC = 3
     LOG_RETENTION_DAYS = 7
-    OUTPUT_RETENTION_DAYS = 30
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -223,29 +221,8 @@ def _cleanup_task_logs(task_dir: Path):
 
 
 def _cleanup_task_outputs(task: Task, task_dir: Path, current_output: Optional[Path]):
-    """清理输出文件夹。
-
-    - 行情更新类任务（task_type == "market"）：不做任何自动清理，由任务脚本自行控制输出文件（通常是同一个增量文件）。
-    - 其他任务：按保留天数清理历史输出目录。
-    """
-    # 行情更新类任务：完全交给任务脚本自己管理 output 下的文件
-    if (task.task_type or "factor") == "market":
-        return
-
-    output_root = task_dir / "output"
-    if not output_root.exists():
-        return
-
-    retention_days = max(int(OUTPUT_RETENTION_DAYS or 0), 0)
-    if retention_days <= 0:
-        return
-    cutoff = time.time() - retention_days * 86400
-    for path in output_root.iterdir():
-        try:
-            if path.is_dir() and path.stat().st_mtime < cutoff:
-                shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
+    """输出目录由任务脚本自行管理，系统不做自动清理。"""
+    pass
 
 
 def _resolve_run_log_file(task_dir: Path, log_path: Optional[str]) -> Path:
