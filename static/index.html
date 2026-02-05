@@ -356,6 +356,50 @@
             color: #8b949e;
         }
 
+        .log-drawer-body {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            min-height: 0;
+        }
+        .log-drawer-panel {
+            flex-shrink: 0;
+            margin-bottom: 16px;
+        }
+        .log-drawer-panel h4 {
+            margin: 0 0 12px 0;
+            font-weight: 600;
+            font-size: 14px;
+            color: var(--text-main);
+        }
+        .log-drawer-task-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 16px;
+            padding: 12px 16px;
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: var(--border-radius);
+            font-size: 13px;
+        }
+        .log-drawer-task-row .task-name { font-weight: 600; color: var(--text-main); min-width: 120px; }
+        .log-drawer-task-row .task-meta { color: var(--text-secondary); }
+        .log-drawer-task-row .task-actions { margin-left: auto; display: flex; gap: 8px; flex-shrink: 0; }
+        .log-drawer-log-section {
+            flex: 1;
+            min-height: 200px;
+            display: flex;
+            flex-direction: column;
+        }
+        .log-drawer-log-section .log-container {
+            flex: 1;
+            height: 100%;
+            min-height: 320px;
+        }
+        .log-drawer-title { font-weight: 600; }
+        .log-drawer .el-drawer__body { display: flex; flex-direction: column; padding: 16px 20px; height: 100%; min-height: 0; overflow: hidden; }
+
         .env-tag {
             background: #f3f4f6;
             color: #374151;
@@ -625,45 +669,85 @@
             </template>
         </el-dialog>
 
-        <el-dialog v-model="logVisible" :title="currentTaskName" class="log-dialog" @close="stopLogTail">
-            <div class="log-container">
-                <div class="log-header">
-                    <div style="display: flex; align-items: center; gap: 12px;">
-                        <span>Terminal Output</span>
-                        <el-select
-                            v-model="currentRunId"
-                            size="small"
-                            placeholder="选择运行记录"
-                            style="min-width: 320px;"
-                            @change="fetchLog">
-                            <el-option
-                                v-for="run in runs"
-                                :key="run.id"
-                                :label="runLogOptionLabel(run)"
-                                :value="run.id">
-                            </el-option>
-                        </el-select>
-                        <el-button size="small" @click="refreshRunsAndMaybeSwitch()">刷新运行列表</el-button>
-                        <span v-if="currentRunStatus === 'Running'" class="log-status-badge log-status-live">实时</span>
-                        <span v-else-if="currentRunStatus" class="log-status-badge log-status-ended">已结束</span>
-                    </div>
-                    <span>Env: {{ currentEnv }}</span>
-                </div>
-                <div class="log-content-wrap" v-loading="logLoading">
-                    <template v-if="logError">
-                        <div class="log-placeholder">
-                            <span>加载失败</span>
-                            <span v-if="logErrorMessage" class="log-error-msg">{{ logErrorMessage }}</span>
-                            <el-button type="primary" size="small" @click="logError = false; fetchLog()">重试</el-button>
+        <el-drawer
+            v-model="logVisible"
+            title="查看日志"
+            direction="rtl"
+            size="80%"
+            destroy-on-close
+            class="log-drawer"
+            @close="onLogDrawerClose">
+            <template #header>
+                <span class="log-drawer-title">查看日志 · {{ currentTaskName }}</span>
+            </template>
+            <div class="log-drawer-body">
+                <div class="log-drawer-panel">
+                    <h4>任务监控面板</h4>
+                    <div class="log-drawer-task-row" v-if="logDrawerTask">
+                        <div class="task-name">{{ logDrawerTask.name }}</div>
+                        <div class="task-meta">{{ logDrawerTask.script }}</div>
+                        <span class="env-tag">conda: {{ logDrawerTask.env }}</span>
+                        <span class="task-meta">每天 {{ logDrawerTask.schedule }}</span>
+                        <el-tag size="small" :type="logDrawerTask.task_type === 'market' ? 'success' : 'info'">
+                            {{ logDrawerTask.task_type === 'market' ? '行情更新' : '因子计算' }}
+                        </el-tag>
+                        <div class="status-badge" :class="'state-' + logDrawerTask.status">
+                            <span class="dot"></span>
+                            {{ logDrawerTask.status }}
                         </div>
-                    </template>
-                    <template v-else-if="!logContent && !logLoading">
-                        <div class="log-placeholder">暂无日志</div>
-                    </template>
-                    <div v-else ref="logContentEl" class="log-content">{{ logContent }}</div>
+                        <span v-if="logDrawerTask.status === 'Running'">{{ formatDuration(getElapsedSeconds(logDrawerTask)) }}</span>
+                        <span v-else class="task-meta">-</span>
+                        <span class="task-meta">{{ logDrawerTask.last_run || '-' }}</span>
+                        <div class="task-actions">
+                            <el-button circle type="primary" plain size="small" @click="openTaskDetail(logDrawerTask)" title="配置任务">
+                                <el-icon><setting /></el-icon>
+                            </el-button>
+                            <el-button circle type="success" plain size="small" :icon="VideoPlay" @click="runNow(logDrawerTask)" :loading="logDrawerTask.status === 'Running'" title="立即运行"></el-button>
+                            <el-button circle type="danger" plain size="small" :icon="Delete" @click="deleteTask(logDrawerTask)" title="删除任务"></el-button>
+                        </div>
+                    </div>
+                </div>
+                <div class="log-drawer-log-section">
+                    <div class="log-container">
+                        <div class="log-header">
+                            <div style="display: flex; align-items: center; gap: 12px;">
+                                <span>Terminal Output</span>
+                                <el-select
+                                    v-model="currentRunId"
+                                    size="small"
+                                    placeholder="选择运行记录"
+                                    style="min-width: 320px;"
+                                    @change="fetchLog">
+                                    <el-option
+                                        v-for="run in runs"
+                                        :key="run.id"
+                                        :label="runLogOptionLabel(run)"
+                                        :value="run.id">
+                                    </el-option>
+                                </el-select>
+                                <el-button size="small" @click="refreshRunsAndMaybeSwitch()">刷新运行列表</el-button>
+                                <span v-if="currentRunStatus === 'Running'" class="log-status-badge log-status-live">实时</span>
+                                <span v-else-if="currentRunStatus" class="log-status-badge log-status-ended">已结束</span>
+                            </div>
+                            <span>Env: {{ currentEnv }}</span>
+                        </div>
+                        <div class="log-content-wrap" v-loading="logLoading">
+                            <template v-if="logError">
+                                <div class="log-placeholder">
+                                    <span>加载失败</span>
+                                    <span v-if="logErrorMessage" class="log-error-msg">{{ logErrorMessage }}</span>
+                                    <el-button type="primary" size="small" @click="logError = false; fetchLog()">重试</el-button>
+                                </div>
+                            </template>
+                            <template v-else-if="!logContent && !logLoading">
+                                <div class="log-placeholder">暂无日志</div>
+                            </template>
+                            <div v-else ref="logContentEl" class="log-content">{{ logContent }}</div>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </el-dialog>
+        </el-drawer>
 
         <el-dialog 
             v-model="editDialogVisible" 
@@ -794,6 +878,7 @@
                     const logTailOffset = ref(0);
                     const logTailTimer = ref(null);
                     const nowTick = ref(Date.now());
+                    const logDrawerTask = ref(null);
 
                     const currentRunStatus = computed(() => {
                         if (!currentRunId.value || !runs.value.length) return null;
@@ -946,9 +1031,15 @@
                         currentTaskId.value = row.id;
                         currentTaskName.value = row.name;
                         currentEnv.value = row.env;
+                        logDrawerTask.value = row ? { ...row } : null;
                         logVisible.value = true;
                         await fetchRuns();
                         fetchLog();
+                    };
+
+                    const onLogDrawerClose = () => {
+                        stopLogTail();
+                        logDrawerTask.value = null;
                     };
 
                     const fetchRuns = async () => {
@@ -1250,7 +1341,8 @@
                         getElapsedSeconds, formatDuration, stopTask, cancelQueueJob,
                         editDialogVisible, editForm, openTaskDetail, saveTaskConfig,
                         Plus, VideoPlay, Document, Refresh, Delete, CircleClose,
-                        deleteTask, stopLogTail
+                        deleteTask, stopLogTail,
+                        logDrawerTask, onLogDrawerClose
                     };
                 }
             });
