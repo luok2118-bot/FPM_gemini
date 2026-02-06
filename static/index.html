@@ -5,11 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FactorPlatform | 因子计算平台</title>
     <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <!-- 字体：离线使用系统字体，如需 Inter/JetBrains Mono 可将字体文件放入 static/fonts 并取消注释
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    
-    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+    -->
+    <link rel="stylesheet" href="/static/vendor/element-plus.css" />
 
     <style>
         /* 弹窗圆角与阴影 */
@@ -173,7 +174,7 @@
         body {
             background-color: var(--bg-color);
             margin: 0;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
             color: var(--text-main);
             -webkit-font-smoothing: antialiased;
             overflow-x: hidden;
@@ -915,10 +916,10 @@
         </el-dialog>
     </div>
 
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://unpkg.com/element-plus"></script>
-    <script src="https://unpkg.com/@element-plus/icons-vue"></script>
-    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script src="/static/vendor/vue.global.prod.js"></script>
+    <script src="/static/vendor/element-plus.min.js"></script>
+    <script src="/static/vendor/element-plus-icons-vue.js"></script>
+    <script src="/static/vendor/axios.min.js"></script>
 
     <script>
         const initApp = () => {
