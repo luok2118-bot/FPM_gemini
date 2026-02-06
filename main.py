@@ -243,6 +243,14 @@ def _get_task_dir(task: Task) -> Path:
     return DATA_ROOT / task.id
 
 
+def _move_task_dir_to_deleted(task_dir: Path, dest_dir: Path) -> None:
+    """将任务目录移动到 tasks_data/deleted 下；若源目录不存在则忽略。"""
+    if not task_dir.exists():
+        return
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(task_dir), str(dest_dir))
+
+
 def _is_trading_day(day: datetime.date) -> bool:
     """使用独立交易日历进行判断；缺失或越界时回退到工作日逻辑。"""
     return calendar_is_trading_day(day)
@@ -1175,15 +1183,19 @@ async def delete_task(task_id: str, bg: BackgroundTasks, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="Task not found")
 
     task_dir = _get_task_dir(task)
+    folder_name = getattr(task, "folder_name", None) or task.id
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest_dir = DATA_ROOT / "deleted" / f"{folder_name}_{timestamp}"
+
     # 1. 立即从数据库和调度器中移除
     db.delete(task)
     db.commit()
     if scheduler.get_job(task_id):
         scheduler.remove_job(task_id)
 
-    # 2. 物理删除交给后台，不阻塞 API 响应，防止死锁
-    bg.add_task(shutil.rmtree, task_dir, ignore_errors=True)
-    
+    # 2. 将任务目录移入 deleted 交给后台，不阻塞 API 响应
+    bg.add_task(_move_task_dir_to_deleted, task_dir, dest_dir)
+
     _event_queue.put_nowait("changed")
     return {"status": "success"}
 
