@@ -220,12 +220,15 @@ def ensure_calendar(
     fetch_start_date: str = "20140101",
     fetch_end_date: Optional[str] = None,
     secu_market: int = 83,
+    force_online_refresh: bool = False,
 ) -> TradingCalendar:
     """
-    若 csv 不存在且允许自动拉取，则尝试在线获取后再加载；否则直接加载（缺失时会回退到 weekday）。
+    初始化/刷新全局交易日历：
+    - 若 csv 不存在且允许自动拉取，或 force_online_refresh=True，则尝试在线获取后再加载；
+    - 否则直接加载本地 csv（缺失时会回退到 weekday）。
     """
     csv_path = Path(csv_path)
-    if not csv_path.exists() and auto_fetch_online:
+    if auto_fetch_online and (force_online_refresh or not csv_path.exists()):
         if not fetch_end_date:
             # 默认取今天起往后一年，格式 YYYYMMDD
             fetch_end_date = (datetime.date.today() + datetime.timedelta(days=365)).strftime("%Y%m%d")

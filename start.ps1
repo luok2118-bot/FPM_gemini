@@ -21,15 +21,13 @@ $ErrorActionPreference = "Stop"
 # Root paths
 $ProjectRootPath = $PSScriptRoot
 
-# Output paths
+# Output paths (PID 文件放在 logs 目录，不再使用 run 目录)
 $LogDirPath = Join-Path $ProjectRootPath "logs"
-$RunDirPath = Join-Path $ProjectRootPath "run"
 $StdoutLogPath = Join-Path $LogDirPath "uvicorn.out.log"
 $StderrLogPath = Join-Path $LogDirPath "uvicorn.err.log"
-$PidFilePath = Join-Path $RunDirPath "uvicorn.pid"
+$PidFilePath = Join-Path $LogDirPath "uvicorn.pid"
 
 New-Item -ItemType Directory -Force -Path $LogDirPath | Out-Null
-New-Item -ItemType Directory -Force -Path $RunDirPath | Out-Null
 
 function Get-CondaExePath {
     # prefer CONDA_EXE if exists

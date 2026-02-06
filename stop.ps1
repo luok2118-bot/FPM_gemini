@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRootPath = $PSScriptRoot
-$PidFilePath = Join-Path $ProjectRootPath "run\uvicorn.pid"
+$PidFilePath = Join-Path $ProjectRootPath "logs\uvicorn.pid"
 
 function Get-ListeningProcessIdByPort([int]$Port) {
     $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

@@ -88,3 +88,25 @@ def notify_task_result(
         logger.opt(exception=True).debug("notify_task_result failed")
         return False
 
+
+def notify_factor_summary(task_name: str, summary_line: str, run_date=None) -> bool:
+    """因子计算任务总结钉钉通知。"""
+    run_str = run_date.strftime("%Y-%m-%d") if run_date else "-"
+    content = f"【FPM】因子计算总结 | {task_name} | {run_str} | {summary_line.strip()}"
+    try:
+        return _send_raw(content)
+    except Exception:
+        logger.opt(exception=True).debug("notify_factor_summary failed")
+        return False
+
+
+def notify_factor_summary_missing(task_name: str, run_date=None) -> bool:
+    """因子计算任务成功但未找到 [FPM] 总结行时发送告警。"""
+    run_str = run_date.strftime("%Y-%m-%d") if run_date else "-"
+    content = f"【FPM】告警 | 因子计算任务 {task_name} 已成功完成，但未在日志中发现 [FPM] 总结行，请检查脚本是否正常输出。| 运行日期={run_str}"
+    try:
+        return _send_raw(content)
+    except Exception:
+        logger.opt(exception=True).debug("notify_factor_summary_missing failed")
+        return False
+
